@@ -50,6 +50,15 @@ try:
 except ImportError:
     has_nvidia_modelopt = False
 
+# Model graph visualization support
+try:
+    from megatron.training.visualization import maybe_visualize_model_graph, get_visualizer
+    HAVE_VISUALIZATION = True
+except ImportError:
+    HAVE_VISUALIZATION = False
+    maybe_visualize_model_graph = None
+    get_visualizer = None
+
 stimer = StragglerDetector()
 
 
@@ -188,6 +197,13 @@ def forward_step(data_iterator, model: GPTModel, return_schedule_plan: bool = Fa
                 output_tensor = model(
                     tokens, position_ids, attention_mask, labels=labels, loss_mask=loss_mask, packed_seq_params=packed_seq_params
                 )
+
+    # Model graph visualization: capture the computation graph if enabled
+    if HAVE_VISUALIZATION and maybe_visualize_model_graph is not None and get_visualizer is not None:
+        visualizer = get_visualizer()
+        if visualizer is not None:
+            iteration = visualizer.get_current_iteration()
+            maybe_visualize_model_graph(model, output_tensor, iteration)
 
     # [ModelOpt]: model is needed to access ModelOpt distillation losses
     return output_tensor, partial(loss_func, loss_mask, model=model)

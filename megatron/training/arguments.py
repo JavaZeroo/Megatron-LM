@@ -87,6 +87,7 @@ def add_megatron_arguments(parser: argparse.ArgumentParser):
     parser = _add_msc_args(parser)
     parser = _add_kitchen_quantization_arguments(parser)
     parser = _add_sft_args(parser)
+    parser = _add_visualization_args(parser)
 
     return parser
 
@@ -3616,4 +3617,46 @@ def _add_sft_args(parser):
     group.add_argument('--sft', action="store_true", help='Megatron SFT training')
     group.add_argument('--sft-tokenizer-prompt-format', type=str, default="nemotron-h-aligned",
                        help='SFT prompt format.')
+    return parser
+
+
+def _add_visualization_args(parser):
+    """Add model graph visualization arguments."""
+    group = parser.add_argument_group(title='model graph visualization')
+    
+    group.add_argument(
+        '--visualize-model-graph',
+        action='store_true',
+        default=False,
+        help='Enable model computation graph visualization using torchviz. '
+             'Requires torchviz and graphviz to be installed.'
+    )
+    group.add_argument(
+        '--visualize-graph-iterations',
+        type=str,
+        default="1",
+        help='Comma-separated list of iterations at which to generate model graphs. '
+             'Default is "1" (only the first iteration). Example: "1,100,1000"'
+    )
+    group.add_argument(
+        '--visualize-graph-interval',
+        type=int,
+        default=None,
+        help='Generate model graph every N iterations. If set, this is in addition to '
+             '--visualize-graph-iterations. Useful for periodic visualization.'
+    )
+    group.add_argument(
+        '--visualize-graph-format',
+        type=str,
+        default="pdf",
+        choices=["pdf", "png", "svg"],
+        help='Output format for the model graph visualization. Default: pdf'
+    )
+    group.add_argument(
+        '--visualize-graph-output-dir',
+        type=str,
+        default=None,
+        help='Output directory for model graphs. Defaults to the save directory (--save).'
+    )
+    
     return parser

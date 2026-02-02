@@ -1,0 +1,466 @@
+# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+
+"""
+Megatron-LM 计算图可视化集成模块
+
+此模块提供将 torchviz 可视化集成到 Megatron-LM 训练流程中的功能。
+它可以在训练的指定步骤捕获模型的计算图并生成可视化文件。
+
+使用示例：
+    # 在 pretrain_gpt.py 或其他预训练脚本中：
+    
+    from megatron.training.visualization import (
+        setup_model_graph_visualization,
+        maybe_visualize_model_graph,
+    )
+    
+    # 在 pretrain() 调用前设置
+    setup_model_graph_visualization(args)
+    
+    # 在 forward_step 中调用
+    def forward_step(data_iterator, model, ...):
+        output = model(...)
+        maybe_visualize_model_graph(model, output, iteration)
+        return output, loss_func
+"""
+
+import os
+from typing import Optional, Union, List, Tuple, Any
+from functools import wraps
+
+import torch
+import torch.nn as nn
+
+# 尝试导入 torchviz
+try:
+    from torchviz import make_dot
+    HAVE_TORCHVIZ = True
+except ImportError:
+    HAVE_TORCHVIZ = False
+
+
+class MegatronGraphVisualizer:
+    """
+    专门为 Megatron-LM 设计的计算图可视化器。
+    
+    支持：
+    - 分布式训练（数据并行、张量并行、流水线并行）
+    - 虚拟流水线并行
+    - 各种模型包装器（DDP, Float16Module 等）
+    """
+    
+    _instance = None
+    
+    def __init__(
+        self,
+        output_dir: str,
+        iterations_to_visualize: List[int],
+        visualize_interval: Optional[int] = None,
+        output_format: str = "pdf",
+        include_shapes: bool = True,
+        max_depth: Optional[int] = None,
+    ):
+        self.output_dir = output_dir
+        self.iterations_to_visualize = set(iterations_to_visualize)
+        self.visualize_interval = visualize_interval
+        self.output_format = output_format
+        self.include_shapes = include_shapes
+        self.max_depth = max_depth
+        self._visualized_iterations = set()
+        self._enabled = HAVE_TORCHVIZ
+        self._current_iteration = 0
+        
+        # 创建输出目录
+        if self._should_create_on_this_rank():
+            os.makedirs(os.path.join(output_dir, "model_graphs"), exist_ok=True)
+    
+    @classmethod
+    def get_instance(cls) -> Optional['MegatronGraphVisualizer']:
+        """获取单例实例"""
+        return cls._instance
+    
+    @classmethod
+    def initialize(cls, **kwargs) -> 'MegatronGraphVisualizer':
+        """初始化并返回单例实例"""
+        cls._instance = cls(**kwargs)
+        return cls._instance
+    
+    def set_current_iteration(self, iteration: int):
+        """设置当前迭代步骤"""
+        self._current_iteration = iteration
+    
+    def get_current_iteration(self) -> int:
+        """获取当前迭代步骤"""
+        return self._current_iteration
+    
+    def _get_parallel_state(self) -> dict:
+        """获取并行状态信息"""
+        try:
+            from megatron.core import parallel_state
+            
+            if not parallel_state.is_initialized():
+                return {
+                    'global_rank': 0,
+                    'dp_rank': 0,
+                    'tp_rank': 0,
+                    'pp_rank': 0,
+                    'vp_rank': 0,
+                    'world_size': 1,
+                }
+            
+            return {
+                'global_rank': torch.distributed.get_rank() if torch.distributed.is_initialized() else 0,
+                'dp_rank': parallel_state.get_data_parallel_rank(),
+                'tp_rank': parallel_state.get_tensor_model_parallel_rank(),
+                'pp_rank': parallel_state.get_pipeline_model_parallel_rank(),
+                'vp_rank': parallel_state.get_virtual_pipeline_model_parallel_rank() or 0,
+                'world_size': torch.distributed.get_world_size() if torch.distributed.is_initialized() else 1,
+                'tp_world_size': parallel_state.get_tensor_model_parallel_world_size(),
+                'pp_world_size': parallel_state.get_pipeline_model_parallel_world_size(),
+                'dp_world_size': parallel_state.get_data_parallel_world_size(),
+            }
+        except Exception:
+            return {
+                'global_rank': 0,
+                'dp_rank': 0,
+                'tp_rank': 0,
+                'pp_rank': 0,
+                'vp_rank': 0,
+                'world_size': 1,
+            }
+    
+    def _should_create_on_this_rank(self) -> bool:
+        """判断是否应该在当前 rank 创建输出目录"""
+        state = self._get_parallel_state()
+        # 只在 global rank 0 创建目录
+        return state['global_rank'] == 0
+    
+    def _should_visualize_on_this_rank(self) -> bool:
+        """判断是否应该在当前 rank 执行可视化"""
+        state = self._get_parallel_state()
+        # 在 DP rank 0, TP rank 0 上可视化（每个 PP stage 都会生成）
+        return state['dp_rank'] == 0 and state['tp_rank'] == 0
+    
+    def should_visualize_at_iteration(self, iteration: int) -> bool:
+        """检查是否应该在指定迭代可视化"""
+        if not self._enabled:
+            return False
+        
+        if iteration in self._visualized_iterations:
+            return False
+        
+        if iteration in self.iterations_to_visualize:
+            return True
+        
+        if self.visualize_interval and iteration > 0:
+            if iteration % self.visualize_interval == 0:
+                return True
+        
+        return False
+    
+    def _get_output_path(self, iteration: int, model_chunk_id: int = 0) -> str:
+        """生成输出文件路径"""
+        state = self._get_parallel_state()
+        
+        filename = f"model_graph_iter{iteration:06d}"
+        filename += f"_pp{state['pp_rank']}"
+        
+        if state.get('vp_rank', 0) > 0 or model_chunk_id > 0:
+            filename += f"_vp{model_chunk_id}"
+        
+        return os.path.join(self.output_dir, "model_graphs", filename)
+    
+    def _unwrap_model(self, model):
+        """解包模型获取底层 nn.Module"""
+        unwrapped = model
+        
+        # 常见的包装器类型
+        wrapper_attrs = ['module', 'model']
+        
+        max_iterations = 10  # 防止无限循环
+        for _ in range(max_iterations):
+            found_wrapper = False
+            for attr in wrapper_attrs:
+                if hasattr(unwrapped, attr):
+                    unwrapped = getattr(unwrapped, attr)
+                    found_wrapper = True
+                    break
+            if not found_wrapper:
+                break
+        
+        return unwrapped
+    
+    def _extract_output_tensor(self, output) -> Optional[torch.Tensor]:
+        """从模型输出中提取张量"""
+        if isinstance(output, torch.Tensor):
+            return output if output.grad_fn is not None else None
+        
+        if isinstance(output, (list, tuple)):
+            for item in output:
+                tensor = self._extract_output_tensor(item)
+                if tensor is not None:
+                    return tensor
+        
+        if isinstance(output, dict):
+            for value in output.values():
+                tensor = self._extract_output_tensor(value)
+                if tensor is not None:
+                    return tensor
+        
+        return None
+    
+    def visualize(
+        self,
+        model: Union[nn.Module, List[nn.Module]],
+        output: Union[torch.Tensor, Tuple, List],
+        iteration: int,
+    ) -> List[str]:
+        """
+        执行计算图可视化。
+        
+        Args:
+            model: 模型或模型列表（用于虚拟流水线）
+            output: 模型输出
+            iteration: 当前迭代步骤
+        
+        Returns:
+            生成的文件路径列表
+        """
+        if not self.should_visualize_at_iteration(iteration):
+            return []
+        
+        if not self._should_visualize_on_this_rank():
+            self._visualized_iterations.add(iteration)  # 标记为已处理
+            return []
+        
+        state = self._get_parallel_state()
+        generated_files = []
+        
+        # 处理模型列表（虚拟流水线）
+        models = model if isinstance(model, list) else [model]
+        
+        for chunk_id, model_chunk in enumerate(models):
+            try:
+                # 解包模型
+                unwrapped = self._unwrap_model(model_chunk)
+                
+                # 收集参数
+                params = {name: param for name, param in unwrapped.named_parameters()}
+                
+                # 提取输出张量
+                output_tensor = self._extract_output_tensor(output)
+                
+                if output_tensor is None:
+                    self._print_rank_0(f"[Rank {state['global_rank']}] Warning: Could not extract output tensor with grad_fn")
+                    continue
+                
+                # 生成计算图
+                dot = make_dot(
+                    output_tensor,
+                    params=params,
+                    show_attrs=self.include_shapes,
+                    show_saved=False,
+                )
+                
+                # 设置图形属性
+                dot.attr(rankdir='TB')
+                dot.attr('graph', label=f'Megatron-LM Model Graph\nIteration: {iteration}, PP Stage: {state["pp_rank"]}')
+                dot.attr('graph', fontsize='14')
+                dot.attr('node', fontsize='10')
+                
+                # 保存
+                output_path = self._get_output_path(iteration, chunk_id)
+                output_file = dot.render(output_path, format=self.output_format, cleanup=True)
+                
+                self._print_rank_0(f"[Rank {state['global_rank']}] Model graph saved: {output_file}")
+                generated_files.append(output_file)
+                
+            except Exception as e:
+                self._print_rank_0(f"[Rank {state['global_rank']}] Error visualizing model chunk {chunk_id}: {e}")
+                import traceback
+                traceback.print_exc()
+        
+        if generated_files:
+            self._visualized_iterations.add(iteration)
+        
+        return generated_files
+    
+    def _print_rank_0(self, message: str):
+        """只在 rank 0 打印消息"""
+        state = self._get_parallel_state()
+        if state['global_rank'] == 0:
+            print(message)
+    
+    def visualize_with_dummy_forward(
+        self,
+        model: Union[nn.Module, List[nn.Module]],
+        iteration: int,
+        batch_size: int = 1,
+        seq_length: int = 128,
+        vocab_size: int = 50304,
+    ) -> List[str]:
+        """
+        使用虚拟输入执行一次前向传播并可视化。
+        
+        这是一种替代方法，当无法从训练循环获取实际输出时使用。
+        
+        Args:
+            model: 模型或模型列表
+            iteration: 当前迭代
+            batch_size: 批量大小
+            seq_length: 序列长度
+            vocab_size: 词汇表大小
+        
+        Returns:
+            生成的文件路径列表
+        """
+        if not self.should_visualize_at_iteration(iteration):
+            return []
+        
+        if not self._should_visualize_on_this_rank():
+            self._visualized_iterations.add(iteration)
+            return []
+        
+        state = self._get_parallel_state()
+        generated_files = []
+        
+        models = model if isinstance(model, list) else [model]
+        
+        for chunk_id, model_chunk in enumerate(models):
+            try:
+                unwrapped = self._unwrap_model(model_chunk)
+                device = next(unwrapped.parameters()).device
+                
+                # 创建虚拟输入
+                input_ids = torch.randint(0, vocab_size, (batch_size, seq_length), device=device)
+                position_ids = torch.arange(seq_length, device=device).unsqueeze(0).expand(batch_size, -1)
+                attention_mask = torch.ones(batch_size, seq_length, device=device)
+                
+                # 临时设置为评估模式并执行前向传播
+                was_training = unwrapped.training
+                unwrapped.eval()
+                
+                with torch.enable_grad():
+                    # 尝试不同的前向传播签名
+                    try:
+                        output = unwrapped(input_ids, position_ids, attention_mask)
+                    except TypeError:
+                        try:
+                            output = unwrapped(input_ids)
+                        except Exception:
+                            self._print_rank_0(f"Could not perform forward pass for visualization")
+                            continue
+                
+                if was_training:
+                    unwrapped.train()
+                
+                # 可视化
+                files = self.visualize(model_chunk, output, iteration)
+                generated_files.extend(files)
+                
+            except Exception as e:
+                self._print_rank_0(f"[Rank {state['global_rank']}] Error in dummy forward: {e}")
+                import traceback
+                traceback.print_exc()
+        
+        return generated_files
+
+
+def setup_model_graph_visualization(args) -> Optional[MegatronGraphVisualizer]:
+    """
+    从 Megatron 参数设置可视化。
+    
+    Args:
+        args: Megatron 命令行参数
+    
+    Returns:
+        MegatronGraphVisualizer 实例，如果未启用则返回 None
+    """
+    if not getattr(args, 'visualize_model_graph', False):
+        return None
+    
+    if not HAVE_TORCHVIZ:
+        try:
+            from megatron.training import print_rank_0
+            print_rank_0("Warning: --visualize-model-graph is set but torchviz is not installed. "
+                        "Please install it with: pip install torchviz graphviz")
+        except:
+            print("Warning: torchviz not installed")
+        return None
+    
+    # 解析迭代步骤
+    iterations_str = getattr(args, 'visualize_graph_iterations', "1")
+    iterations = [int(x.strip()) for x in iterations_str.split(',') if x.strip()]
+    
+    # 确定输出目录
+    output_dir = getattr(args, 'visualize_graph_output_dir', None)
+    if output_dir is None:
+        output_dir = getattr(args, 'save', None)
+    if output_dir is None:
+        output_dir = "./checkpoints"
+    
+    return MegatronGraphVisualizer.initialize(
+        output_dir=output_dir,
+        iterations_to_visualize=iterations,
+        visualize_interval=getattr(args, 'visualize_graph_interval', None),
+        output_format=getattr(args, 'visualize_graph_format', 'pdf'),
+        include_shapes=True,
+    )
+
+
+def maybe_visualize_model_graph(
+    model: Union[nn.Module, List[nn.Module]],
+    output: Union[torch.Tensor, Tuple, List],
+    iteration: int,
+) -> List[str]:
+    """
+    在训练中调用的便捷函数。
+    
+    如果可视化器已初始化且满足条件，则生成计算图。
+    
+    Args:
+        model: 模型
+        output: 模型输出
+        iteration: 当前迭代
+    
+    Returns:
+        生成的文件路径列表
+    """
+    visualizer = MegatronGraphVisualizer.get_instance()
+    if visualizer is None:
+        return []
+    
+    return visualizer.visualize(model, output, iteration)
+
+
+def get_visualizer() -> Optional[MegatronGraphVisualizer]:
+    """获取全局可视化器实例"""
+    return MegatronGraphVisualizer.get_instance()
+
+
+def create_visualization_forward_step_wrapper(forward_step_func, get_iteration_func):
+    """
+    创建一个包装器，用于在 forward_step 中自动调用可视化。
+    
+    Args:
+        forward_step_func: 原始的 forward_step 函数
+        get_iteration_func: 获取当前迭代步骤的函数
+    
+    Returns:
+        包装后的 forward_step 函数
+    """
+    @wraps(forward_step_func)
+    def wrapped_forward_step(data_iterator, model, *args, **kwargs):
+        output_tensor, loss_func = forward_step_func(data_iterator, model, *args, **kwargs)
+        
+        # 尝试可视化
+        try:
+            iteration = get_iteration_func()
+            maybe_visualize_model_graph(model, output_tensor, iteration)
+        except Exception as e:
+            # 可视化失败不应影响训练
+            pass
+        
+        return output_tensor, loss_func
+    
+    return wrapped_forward_step

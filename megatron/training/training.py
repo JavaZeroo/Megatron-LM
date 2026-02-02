@@ -192,6 +192,20 @@ from .dgrad_logging import enable_dgrad_logging, disable_dgrad_logging, save_dgr
 
 from . import ft_integration
 
+# Model graph visualization support
+try:
+    from .visualization import (
+        setup_model_graph_visualization,
+        maybe_visualize_model_graph,
+        MegatronGraphVisualizer,
+    )
+    HAVE_VISUALIZATION = True
+except ImportError:
+    HAVE_VISUALIZATION = False
+    setup_model_graph_visualization = None
+    maybe_visualize_model_graph = None
+    MegatronGraphVisualizer = None
+
 stimer = StragglerDetector()
 
 from megatron.core.msc_utils import MultiStorageClientFeature, open_file
@@ -906,6 +920,15 @@ def pretrain(
     timers('model-and-optimizer-setup').stop()
     print_datetime('after model, optimizer, and learning rate ' 'scheduler are built')
     config = get_model_config(model[0])
+
+    # Initialize model graph visualization if requested.
+    if HAVE_VISUALIZATION and setup_model_graph_visualization is not None:
+        visualizer = setup_model_graph_visualization(args)
+        if visualizer:
+            print_rank_0('> Model graph visualization enabled')
+    else:
+        if getattr(args, 'visualize_model_graph', False):
+            print_rank_0('Warning: --visualize-model-graph is set but visualization module is not available.')
 
     # Build a separate inference model for RL if requested.
     inference_model = None
@@ -2759,6 +2782,13 @@ def train(
             continue
 
         args.curr_iteration = iteration
+
+        # Update visualization iteration counter if enabled
+        if HAVE_VISUALIZATION and MegatronGraphVisualizer is not None:
+            visualizer = MegatronGraphVisualizer.get_instance()
+            if visualizer is not None:
+                visualizer.set_current_iteration(iteration)
+
         # For GRPO, we keep the data for a few epochs. DeepSeekMath paper calls this number $\mu$.
         # It is similar to a PPO epoch.
 
