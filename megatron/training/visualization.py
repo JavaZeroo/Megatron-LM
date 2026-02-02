@@ -3,11 +3,15 @@
 """
 Megatron-LM 计算图可视化集成模块
 
-此模块提供将 torchviz 可视化集成到 Megatron-LM 训练流程中的功能。
-它可以在训练的指定步骤捕获模型的计算图并生成可视化文件。
+此模块提供将模型导出为 ONNX 格式，以便使用 Netron 进行可视化。
+它可以在训练的指定步骤捕获模型并生成 ONNX 文件。
 
-重要：可视化使用"延迟执行"策略 - 在 forward 时保存计算图信息，
-在反向传播完成后（train_step 结束时）再生成可视化文件，
+Netron 是一个强大的神经网络可视化工具，支持查看 ONNX、PyTorch 等多种格式。
+- 在线版本：https://netron.app
+- 桌面版本：https://github.com/lutzroeder/netron
+
+重要：可视化使用"延迟执行"策略 - 在 forward 时保存模型信息，
+在反向传播完成后（train_step 结束时）再导出 ONNX 文件，
 以避免干扰训练过程中的梯度计算。
 
 使用示例：
@@ -27,6 +31,11 @@ Megatron-LM 计算图可视化集成模块
     
     # 在 train_step 结束后生成可视化
     finalize_visualization(iteration)
+    
+    # 生成的 .onnx 文件可以用 Netron 打开：
+    # 1. 在线：上传到 https://netron.app
+    # 2. 命令行：netron model_graph.onnx
+    # 3. 桌面应用：直接双击打开
 """
 
 import os
@@ -37,26 +46,36 @@ from functools import wraps
 import torch
 import torch.nn as nn
 
-# 尝试导入 torchviz
+# ONNX 导出始终可用（PyTorch 内置）
+HAVE_ONNX_EXPORT = True
+
+# 检查是否安装了 onnx 库（用于优化和验证，可选）
 try:
-    from torchviz import make_dot
-    HAVE_TORCHVIZ = True
+    import onnx
+    HAVE_ONNX = True
 except ImportError:
-    HAVE_TORCHVIZ = False
+    HAVE_ONNX = False
 
 
 class MegatronGraphVisualizer:
     """
     专门为 Megatron-LM 设计的计算图可视化器。
     
+    使用 ONNX 导出模型，然后可以用 Netron 查看。
+    
     使用延迟执行策略：
     1. capture_graph() - 在 forward 时保存模型参数名称映射
-    2. finalize() - 在反向传播完成后，使用保存的信息生成可视化
+    2. finalize() - 在反向传播完成后，导出 ONNX 文件
     
     支持：
     - 分布式训练（数据并行、张量并行、流水线并行）
     - 虚拟流水线并行
     - 各种模型包装器（DDP, Float16Module 等）
+    
+    生成的 ONNX 文件可以用 Netron 打开：
+    - 在线：https://netron.app
+    - 命令行：netron model_graph.onnx
+    - 桌面应用：直接双击打开
     """
     
     _instance = None
@@ -66,18 +85,20 @@ class MegatronGraphVisualizer:
         output_dir: str,
         iterations_to_visualize: List[int],
         visualize_interval: Optional[int] = None,
-        output_format: str = "pdf",
+        output_format: str = "onnx",
         include_shapes: bool = True,
         max_depth: Optional[int] = None,
+        opset_version: int = 14,
     ):
         self.output_dir = output_dir
         self.iterations_to_visualize = set(iterations_to_visualize)
         self.visualize_interval = visualize_interval
-        self.output_format = output_format
+        self.output_format = output_format  # 保留参数但始终使用 onnx
         self.include_shapes = include_shapes
         self.max_depth = max_depth
+        self.opset_version = opset_version
         self._visualized_iterations = set()
-        self._enabled = HAVE_TORCHVIZ
+        self._enabled = HAVE_ONNX_EXPORT
         self._current_iteration = 0
         
         # 延迟执行：保存捕获的信息
@@ -278,11 +299,10 @@ class MegatronGraphVisualizer:
         """
         完成可视化 - 在反向传播完成后调用。
         
-        此方法使用一个简单的虚拟前向传播来生成计算图，
-        而不是依赖训练中的实际输出，以避免任何干扰。
+        此方法将模型导出为 ONNX 格式，可以使用 Netron 查看。
         
         Returns:
-            生成的文件路径列表
+            生成的 ONNX 文件路径列表
         """
         if self._pending_visualization is None:
             return []
@@ -309,11 +329,10 @@ class MegatronGraphVisualizer:
                 device = next(unwrapped.parameters()).device
                 dtype = next(unwrapped.parameters()).dtype
                 
-                # 使用虚拟输入进行一次干净的前向传播
-                # 这样生成的计算图不会与训练循环产生任何冲突
+                # 使用虚拟输入进行 ONNX 导出
                 batch_size = 1
-                seq_length = 16  # 使用较小的序列长度以节省内存
-                vocab_size = 50304  # 默认词汇表大小
+                seq_length = 32  # 使用较小的序列长度以节省内存
+                vocab_size = 151936  # 默认词汇表大小
                 
                 # 尝试从模型获取实际配置
                 try:
@@ -328,89 +347,127 @@ class MegatronGraphVisualizer:
                 was_training = unwrapped.training
                 unwrapped.eval()
                 
-                with torch.no_grad():
-                    # 创建虚拟输入
-                    input_ids = torch.randint(
-                        0, vocab_size, (batch_size, seq_length), 
-                        device=device, dtype=torch.long
-                    )
-                    position_ids = torch.arange(
-                        seq_length, device=device, dtype=torch.long
-                    ).unsqueeze(0)
-                    attention_mask = torch.ones(
-                        batch_size, 1, seq_length, seq_length,
-                        device=device, dtype=dtype
-                    )
+                # 创建虚拟输入
+                input_ids = torch.randint(
+                    0, vocab_size, (batch_size, seq_length), 
+                    device=device, dtype=torch.long
+                )
+                position_ids = torch.arange(
+                    seq_length, device=device, dtype=torch.long
+                ).unsqueeze(0)
+                attention_mask = torch.ones(
+                    batch_size, 1, seq_length, seq_length,
+                    device=device, dtype=torch.bool
+                )
                 
-                # 在 enable_grad 上下文中执行前向传播以获取计算图
-                with torch.enable_grad():
-                    # 需要梯度的输入
-                    input_for_graph = input_ids.clone()
-                    
-                    try:
-                        # 尝试标准的 forward 签名
-                        output = unwrapped(
-                            input_ids=input_for_graph,
+                # 确定模型的输入格式
+                dummy_inputs = None
+                input_names = None
+                dynamic_axes = None
+                
+                try:
+                    # 尝试使用关键字参数
+                    with torch.no_grad():
+                        _ = unwrapped(
+                            input_ids=input_ids,
                             position_ids=position_ids,
                             attention_mask=attention_mask,
                         )
+                    dummy_inputs = (input_ids, position_ids, attention_mask)
+                    input_names = ['input_ids', 'position_ids', 'attention_mask']
+                    dynamic_axes = {
+                        'input_ids': {0: 'batch_size', 1: 'seq_length'},
+                        'position_ids': {0: 'batch_size', 1: 'seq_length'},
+                        'attention_mask': {0: 'batch_size', 2: 'seq_length', 3: 'seq_length'},
+                        'output': {0: 'batch_size', 1: 'seq_length'},
+                    }
+                except TypeError:
+                    try:
+                        with torch.no_grad():
+                            _ = unwrapped(input_ids, position_ids, attention_mask)
+                        dummy_inputs = (input_ids, position_ids, attention_mask)
+                        input_names = ['input_ids', 'position_ids', 'attention_mask']
+                        dynamic_axes = {
+                            'input_ids': {0: 'batch_size', 1: 'seq_length'},
+                            'position_ids': {0: 'batch_size', 1: 'seq_length'},
+                            'attention_mask': {0: 'batch_size'},
+                            'output': {0: 'batch_size'},
+                        }
                     except TypeError:
                         try:
-                            output = unwrapped(input_for_graph, position_ids, attention_mask)
-                        except TypeError:
-                            try:
-                                output = unwrapped(input_for_graph)
-                            except Exception as e:
-                                self._print_rank_0(f"Could not perform forward pass: {e}")
-                                if was_training:
-                                    unwrapped.train()
-                                continue
-                    
-                    # 提取输出张量
-                    output_tensor = self._extract_output_tensor(output)
-                    
-                    if output_tensor is None or output_tensor.grad_fn is None:
-                        self._print_rank_0(f"Warning: Could not get valid output tensor for visualization")
-                        if was_training:
-                            unwrapped.train()
-                        continue
-                    
-                    # 收集参数
-                    params = {name: param for name, param in unwrapped.named_parameters()}
-                    
-                    # 生成计算图
-                    dot = make_dot(
-                        output_tensor,
-                        params=params,
-                        show_attrs=self.include_shapes,
-                        show_saved=False,
+                            with torch.no_grad():
+                                _ = unwrapped(input_ids)
+                            dummy_inputs = (input_ids,)
+                            input_names = ['input_ids']
+                            dynamic_axes = {
+                                'input_ids': {0: 'batch_size', 1: 'seq_length'},
+                                'output': {0: 'batch_size', 1: 'seq_length'},
+                            }
+                        except Exception as e:
+                            self._print_rank_0(f"Could not determine model input format: {e}")
+                            if was_training:
+                                unwrapped.train()
+                            continue
+                
+                # 生成输出路径
+                output_path = self._get_output_path(iteration, chunk_id) + ".onnx"
+                
+                # 导出 ONNX
+                try:
+                    torch.onnx.export(
+                        unwrapped,
+                        dummy_inputs,
+                        output_path,
+                        input_names=input_names,
+                        output_names=['output'],
+                        dynamic_axes=dynamic_axes,
+                        opset_version=self.opset_version,
+                        do_constant_folding=True,
+                        export_params=True,
+                        verbose=False,
                     )
+                    
+                    self._print_rank_0(
+                        f"[Rank {state['global_rank']}] ONNX model exported: {output_path}\n"
+                        f"  View with Netron: https://netron.app or run 'netron {output_path}'"
+                    )
+                    generated_files.append(output_path)
+                    
+                    # 可选：验证导出的模型
+                    if HAVE_ONNX:
+                        try:
+                            onnx_model = onnx.load(output_path)
+                            onnx.checker.check_model(onnx_model)
+                            self._print_rank_0(f"  ONNX model validation passed")
+                        except Exception as e:
+                            self._print_rank_0(f"  ONNX validation warning: {e}")
+                            
+                except Exception as e:
+                    self._print_rank_0(f"ONNX export failed: {e}")
+                    # 尝试使用 TorchScript 作为后备
+                    try:
+                        ts_path = self._get_output_path(iteration, chunk_id) + ".pt"
+                        traced_model = torch.jit.trace(unwrapped, dummy_inputs)
+                        traced_model.save(ts_path)
+                        self._print_rank_0(
+                            f"[Rank {state['global_rank']}] TorchScript model saved (ONNX failed): {ts_path}\n"
+                            f"  View with Netron: https://netron.app"
+                        )
+                        generated_files.append(ts_path)
+                    except Exception as e2:
+                        self._print_rank_0(f"TorchScript export also failed: {e2}")
                 
                 # 恢复训练状态
                 if was_training:
                     unwrapped.train()
                 
-                # 设置图形属性
-                dot.attr(rankdir='TB')
-                dot.attr('graph', label=f'Megatron-LM Model Graph\nIteration: {iteration}, PP Stage: {state["pp_rank"]}')
-                dot.attr('graph', fontsize='14')
-                dot.attr('node', fontsize='10')
-                
-                # 保存
-                output_path = self._get_output_path(iteration, chunk_id)
-                output_file = dot.render(output_path, format=self.output_format, cleanup=True)
-                
-                self._print_rank_0(f"[Rank {state['global_rank']}] Model graph saved: {output_file}")
-                generated_files.append(output_file)
-                
                 # 清理
-                del output, output_tensor, dot
                 gc.collect()
                 if torch.cuda.is_available():
                     torch.cuda.empty_cache()
                 
             except Exception as e:
-                self._print_rank_0(f"[Rank {state['global_rank']}] Error visualizing model chunk {chunk_id}: {e}")
+                self._print_rank_0(f"[Rank {state['global_rank']}] Error exporting model chunk {chunk_id}: {e}")
                 import traceback
                 traceback.print_exc()
         
@@ -521,6 +578,11 @@ def setup_model_graph_visualization(args) -> Optional[MegatronGraphVisualizer]:
     """
     从 Megatron 参数设置可视化。
     
+    生成的 ONNX 文件可以使用 Netron 查看：
+    - 在线：https://netron.app
+    - 桌面应用：https://github.com/lutzroeder/netron
+    - 命令行：pip install netron && netron model.onnx
+    
     Args:
         args: Megatron 命令行参数
     
@@ -530,14 +592,8 @@ def setup_model_graph_visualization(args) -> Optional[MegatronGraphVisualizer]:
     if not getattr(args, 'visualize_model_graph', False):
         return None
     
-    if not HAVE_TORCHVIZ:
-        try:
-            from megatron.training import print_rank_0
-            print_rank_0("Warning: --visualize-model-graph is set but torchviz is not installed. "
-                        "Please install it with: pip install torchviz graphviz")
-        except:
-            print("Warning: torchviz not installed")
-        return None
+    # ONNX 导出使用 PyTorch 内置功能，无需额外依赖
+    # 可选安装 onnx 库用于验证：pip install onnx
     
     # 解析迭代步骤
     iterations_str = getattr(args, 'visualize_graph_iterations', "1")
@@ -554,8 +610,9 @@ def setup_model_graph_visualization(args) -> Optional[MegatronGraphVisualizer]:
         output_dir=output_dir,
         iterations_to_visualize=iterations,
         visualize_interval=getattr(args, 'visualize_graph_interval', None),
-        output_format=getattr(args, 'visualize_graph_format', 'pdf'),
+        output_format='onnx',  # 始终使用 ONNX 格式
         include_shapes=True,
+        opset_version=getattr(args, 'visualize_graph_opset_version', 14),
     )
 
 
