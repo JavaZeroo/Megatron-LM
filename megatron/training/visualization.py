@@ -6,25 +6,31 @@ Megatron-LM 计算图可视化集成模块
 此模块提供将 torchviz 可视化集成到 Megatron-LM 训练流程中的功能。
 它可以在训练的指定步骤捕获模型的计算图并生成可视化文件。
 
+重要：可视化使用"延迟执行"策略 - 在 forward 时保存计算图信息，
+在反向传播完成后（train_step 结束时）再生成可视化文件，
+以避免干扰训练过程中的梯度计算。
+
 使用示例：
     # 在 pretrain_gpt.py 或其他预训练脚本中：
     
     from megatron.training.visualization import (
         setup_model_graph_visualization,
-        maybe_visualize_model_graph,
+        maybe_capture_graph_for_visualization,
+        finalize_visualization,
     )
     
-    # 在 pretrain() 调用前设置
-    setup_model_graph_visualization(args)
-    
-    # 在 forward_step 中调用
+    # 在 forward_step 中捕获计算图
     def forward_step(data_iterator, model, ...):
         output = model(...)
-        maybe_visualize_model_graph(model, output, iteration)
+        maybe_capture_graph_for_visualization(model, output)
         return output, loss_func
+    
+    # 在 train_step 结束后生成可视化
+    finalize_visualization(iteration)
 """
 
 import os
+import gc
 from typing import Optional, Union, List, Tuple, Any
 from functools import wraps
 
@@ -42,6 +48,10 @@ except ImportError:
 class MegatronGraphVisualizer:
     """
     专门为 Megatron-LM 设计的计算图可视化器。
+    
+    使用延迟执行策略：
+    1. capture_graph() - 在 forward 时保存模型参数名称映射
+    2. finalize() - 在反向传播完成后，使用保存的信息生成可视化
     
     支持：
     - 分布式训练（数据并行、张量并行、流水线并行）
@@ -69,6 +79,9 @@ class MegatronGraphVisualizer:
         self._visualized_iterations = set()
         self._enabled = HAVE_TORCHVIZ
         self._current_iteration = 0
+        
+        # 延迟执行：保存捕获的信息
+        self._pending_visualization = None
         
         # 创建输出目录
         if self._should_create_on_this_rank():
@@ -209,58 +222,173 @@ class MegatronGraphVisualizer:
         
         return None
     
-    def visualize(
+    def capture_graph(
         self,
         model: Union[nn.Module, List[nn.Module]],
         output: Union[torch.Tensor, Tuple, List],
-        iteration: int,
-    ) -> List[str]:
+    ) -> bool:
         """
-        执行计算图可视化。
+        捕获计算图信息以供后续可视化。
+        
+        此方法应在 forward_step 中调用。它只保存必要的信息，
+        不会执行实际的可视化操作，以避免干扰梯度计算。
         
         Args:
             model: 模型或模型列表（用于虚拟流水线）
             output: 模型输出
-            iteration: 当前迭代步骤
+        
+        Returns:
+            bool: 是否成功捕获
+        """
+        iteration = self._current_iteration
+        
+        if not self.should_visualize_at_iteration(iteration):
+            return False
+        
+        if not self._should_visualize_on_this_rank():
+            return False
+        
+        # 只保存模型引用和参数名称，不做任何可能影响计算图的操作
+        models = model if isinstance(model, list) else [model]
+        
+        captured_info = []
+        for chunk_id, model_chunk in enumerate(models):
+            try:
+                unwrapped = self._unwrap_model(model_chunk)
+                # 只保存参数名称，不访问参数值
+                param_names = list(name for name, _ in unwrapped.named_parameters())
+                captured_info.append({
+                    'chunk_id': chunk_id,
+                    'model': model_chunk,  # 保存模型引用
+                    'param_names': param_names,
+                })
+            except Exception:
+                pass
+        
+        if captured_info:
+            self._pending_visualization = {
+                'iteration': iteration,
+                'models': captured_info,
+            }
+            return True
+        
+        return False
+    
+    def finalize(self) -> List[str]:
+        """
+        完成可视化 - 在反向传播完成后调用。
+        
+        此方法使用一个简单的虚拟前向传播来生成计算图，
+        而不是依赖训练中的实际输出，以避免任何干扰。
         
         Returns:
             生成的文件路径列表
         """
-        if not self.should_visualize_at_iteration(iteration):
+        if self._pending_visualization is None:
             return []
         
-        if not self._should_visualize_on_this_rank():
-            self._visualized_iterations.add(iteration)  # 标记为已处理
+        pending = self._pending_visualization
+        self._pending_visualization = None
+        
+        iteration = pending['iteration']
+        
+        if iteration in self._visualized_iterations:
             return []
         
         state = self._get_parallel_state()
         generated_files = []
         
-        # 处理模型列表（虚拟流水线）
-        models = model if isinstance(model, list) else [model]
-        
-        for chunk_id, model_chunk in enumerate(models):
+        for info in pending['models']:
+            chunk_id = info['chunk_id']
+            model_chunk = info['model']
+            
             try:
-                # 解包模型
                 unwrapped = self._unwrap_model(model_chunk)
                 
-                # 收集参数
-                params = {name: param for name, param in unwrapped.named_parameters()}
+                # 获取模型配置以创建正确大小的虚拟输入
+                device = next(unwrapped.parameters()).device
+                dtype = next(unwrapped.parameters()).dtype
                 
-                # 提取输出张量
-                output_tensor = self._extract_output_tensor(output)
+                # 使用虚拟输入进行一次干净的前向传播
+                # 这样生成的计算图不会与训练循环产生任何冲突
+                batch_size = 1
+                seq_length = 16  # 使用较小的序列长度以节省内存
+                vocab_size = 50304  # 默认词汇表大小
                 
-                if output_tensor is None:
-                    self._print_rank_0(f"[Rank {state['global_rank']}] Warning: Could not extract output tensor with grad_fn")
-                    continue
+                # 尝试从模型获取实际配置
+                try:
+                    if hasattr(unwrapped, 'config'):
+                        config = unwrapped.config
+                        if hasattr(config, 'vocab_size'):
+                            vocab_size = config.vocab_size
+                except Exception:
+                    pass
                 
-                # 生成计算图
-                dot = make_dot(
-                    output_tensor,
-                    params=params,
-                    show_attrs=self.include_shapes,
-                    show_saved=False,
-                )
+                # 保存原始训练状态
+                was_training = unwrapped.training
+                unwrapped.eval()
+                
+                with torch.no_grad():
+                    # 创建虚拟输入
+                    input_ids = torch.randint(
+                        0, vocab_size, (batch_size, seq_length), 
+                        device=device, dtype=torch.long
+                    )
+                    position_ids = torch.arange(
+                        seq_length, device=device, dtype=torch.long
+                    ).unsqueeze(0)
+                    attention_mask = torch.ones(
+                        batch_size, 1, seq_length, seq_length,
+                        device=device, dtype=dtype
+                    )
+                
+                # 在 enable_grad 上下文中执行前向传播以获取计算图
+                with torch.enable_grad():
+                    # 需要梯度的输入
+                    input_for_graph = input_ids.clone()
+                    
+                    try:
+                        # 尝试标准的 forward 签名
+                        output = unwrapped(
+                            input_ids=input_for_graph,
+                            position_ids=position_ids,
+                            attention_mask=attention_mask,
+                        )
+                    except TypeError:
+                        try:
+                            output = unwrapped(input_for_graph, position_ids, attention_mask)
+                        except TypeError:
+                            try:
+                                output = unwrapped(input_for_graph)
+                            except Exception as e:
+                                self._print_rank_0(f"Could not perform forward pass: {e}")
+                                if was_training:
+                                    unwrapped.train()
+                                continue
+                    
+                    # 提取输出张量
+                    output_tensor = self._extract_output_tensor(output)
+                    
+                    if output_tensor is None or output_tensor.grad_fn is None:
+                        self._print_rank_0(f"Warning: Could not get valid output tensor for visualization")
+                        if was_training:
+                            unwrapped.train()
+                        continue
+                    
+                    # 收集参数
+                    params = {name: param for name, param in unwrapped.named_parameters()}
+                    
+                    # 生成计算图
+                    dot = make_dot(
+                        output_tensor,
+                        params=params,
+                        show_attrs=self.include_shapes,
+                        show_saved=False,
+                    )
+                
+                # 恢复训练状态
+                if was_training:
+                    unwrapped.train()
                 
                 # 设置图形属性
                 dot.attr(rankdir='TB')
@@ -275,6 +403,12 @@ class MegatronGraphVisualizer:
                 self._print_rank_0(f"[Rank {state['global_rank']}] Model graph saved: {output_file}")
                 generated_files.append(output_file)
                 
+                # 清理
+                del output, output_tensor, dot
+                gc.collect()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                
             except Exception as e:
                 self._print_rank_0(f"[Rank {state['global_rank']}] Error visualizing model chunk {chunk_id}: {e}")
                 import traceback
@@ -284,6 +418,23 @@ class MegatronGraphVisualizer:
             self._visualized_iterations.add(iteration)
         
         return generated_files
+    
+    def visualize(
+        self,
+        model: Union[nn.Module, List[nn.Module]],
+        output: Union[torch.Tensor, Tuple, List],
+        iteration: int,
+    ) -> List[str]:
+        """
+        [已废弃] 直接执行可视化 - 可能会干扰训练。
+        
+        请改用 capture_graph() + finalize() 的延迟执行模式。
+        
+        此方法保留用于向后兼容，但现在内部使用延迟执行。
+        """
+        self._current_iteration = iteration
+        self.capture_graph(model, output)
+        return self.finalize()
     
     def _print_rank_0(self, message: str):
         """只在 rank 0 打印消息"""
@@ -408,15 +559,59 @@ def setup_model_graph_visualization(args) -> Optional[MegatronGraphVisualizer]:
     )
 
 
+def maybe_capture_graph_for_visualization(
+    model: Union[nn.Module, List[nn.Module]],
+    output: Union[torch.Tensor, Tuple, List],
+) -> bool:
+    """
+    [推荐] 在 forward_step 中捕获计算图信息。
+    
+    此函数只保存必要信息，不执行实际可视化，以避免干扰梯度计算。
+    实际可视化会在 finalize_visualization() 中执行。
+    
+    Args:
+        model: 模型
+        output: 模型输出
+    
+    Returns:
+        bool: 是否成功捕获
+    """
+    visualizer = MegatronGraphVisualizer.get_instance()
+    if visualizer is None:
+        return False
+    
+    return visualizer.capture_graph(model, output)
+
+
+def finalize_visualization() -> List[str]:
+    """
+    [推荐] 在 train_step 结束后完成可视化。
+    
+    此函数应在反向传播完成后调用，它会使用虚拟前向传播
+    生成计算图，避免与训练过程产生任何冲突。
+    
+    Returns:
+        生成的文件路径列表
+    """
+    visualizer = MegatronGraphVisualizer.get_instance()
+    if visualizer is None:
+        return []
+    
+    return visualizer.finalize()
+
+
 def maybe_visualize_model_graph(
     model: Union[nn.Module, List[nn.Module]],
     output: Union[torch.Tensor, Tuple, List],
     iteration: int,
 ) -> List[str]:
     """
-    在训练中调用的便捷函数。
+    [已废弃] 在训练中直接执行可视化。
     
-    如果可视化器已初始化且满足条件，则生成计算图。
+    警告：此函数可能会干扰梯度计算。
+    请改用 maybe_capture_graph_for_visualization() + finalize_visualization()。
+    
+    此函数现在内部使用延迟执行模式。
     
     Args:
         model: 模型
@@ -430,7 +625,10 @@ def maybe_visualize_model_graph(
     if visualizer is None:
         return []
     
-    return visualizer.visualize(model, output, iteration)
+    # 使用延迟执行模式
+    visualizer.set_current_iteration(iteration)
+    visualizer.capture_graph(model, output)
+    return visualizer.finalize()
 
 
 def get_visualizer() -> Optional[MegatronGraphVisualizer]:
@@ -440,7 +638,10 @@ def get_visualizer() -> Optional[MegatronGraphVisualizer]:
 
 def create_visualization_forward_step_wrapper(forward_step_func, get_iteration_func):
     """
-    创建一个包装器，用于在 forward_step 中自动调用可视化。
+    创建一个包装器，用于在 forward_step 中自动捕获计算图。
+    
+    注意：此包装器只执行捕获，不执行可视化。
+    需要在 train_step 结束后调用 finalize_visualization()。
     
     Args:
         forward_step_func: 原始的 forward_step 函数
@@ -453,12 +654,11 @@ def create_visualization_forward_step_wrapper(forward_step_func, get_iteration_f
     def wrapped_forward_step(data_iterator, model, *args, **kwargs):
         output_tensor, loss_func = forward_step_func(data_iterator, model, *args, **kwargs)
         
-        # 尝试可视化
+        # 只捕获，不执行可视化
         try:
-            iteration = get_iteration_func()
-            maybe_visualize_model_graph(model, output_tensor, iteration)
-        except Exception as e:
-            # 可视化失败不应影响训练
+            maybe_capture_graph_for_visualization(model, output_tensor)
+        except Exception:
+            # 捕获失败不应影响训练
             pass
         
         return output_tensor, loss_func

@@ -196,14 +196,16 @@ from . import ft_integration
 try:
     from .visualization import (
         setup_model_graph_visualization,
-        maybe_visualize_model_graph,
+        maybe_capture_graph_for_visualization,
+        finalize_visualization,
         MegatronGraphVisualizer,
     )
     HAVE_VISUALIZATION = True
 except ImportError:
     HAVE_VISUALIZATION = False
     setup_model_graph_visualization = None
-    maybe_visualize_model_graph = None
+    maybe_capture_graph_for_visualization = None
+    finalize_visualization = None
     MegatronGraphVisualizer = None
 
 stimer = StragglerDetector()
@@ -2815,6 +2817,14 @@ def train(
             forward_step_func, train_data_iterator, model, optimizer, opt_param_scheduler, config, forward_backward_func, iteration=iteration
         )
         ft_integration.on_training_step_end()
+        
+        # Finalize model graph visualization if enabled (must be after backward pass)
+        if HAVE_VISUALIZATION and finalize_visualization is not None:
+            try:
+                finalize_visualization()
+            except Exception:
+                pass  # Visualization failures should not affect training
+        
         if should_checkpoint:
             save_checkpoint_and_time(
                 iteration,

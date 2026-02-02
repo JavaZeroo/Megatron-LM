@@ -137,6 +137,7 @@ checkpoints/
 2. **内存使用**: 对于大型模型，生成的图可能非常大
 3. **文件大小**: PDF 格式通常比 PNG 更小且更清晰
 4. **兼容性**: 需要安装 graphviz 系统包
+5. **延迟执行**: 可视化使用延迟执行策略，在反向传播完成后才生成计算图，以避免干扰训练
 
 ## API 使用
 
@@ -145,7 +146,8 @@ checkpoints/
 ```python
 from megatron.training.visualization import (
     setup_model_graph_visualization,
-    maybe_visualize_model_graph,
+    maybe_capture_graph_for_visualization,
+    finalize_visualization,
     MegatronGraphVisualizer,
 )
 
@@ -160,14 +162,18 @@ visualizer = MegatronGraphVisualizer.initialize(
     output_format="pdf",
 )
 
-# 在 forward_step 中调用
+# 在 forward_step 中捕获计算图信息（不执行可视化）
 def forward_step(data_iterator, model):
     output = model(input_ids, position_ids, attention_mask)
     
-    # 可视化（如果条件满足）
-    maybe_visualize_model_graph(model, output, iteration)
+    # 捕获计算图信息（延迟执行）
+    maybe_capture_graph_for_visualization(model, output)
     
     return output, loss_func
+
+# 在 train_step 完成后执行可视化
+# 这一步在 training.py 中已自动处理
+finalize_visualization()
 ```
 
 ## 故障排除
@@ -183,6 +189,10 @@ def forward_step(data_iterator, model):
 - 模型处于 eval 模式
 - 前向传播在 `torch.no_grad()` 上下文中
 解决: 确保可视化在正常的训练前向传播中进行
+
+### 问题: "Cannot access data pointer of Tensor that doesn't have storage"
+原因: 旧版本在 forward 过程中直接执行可视化，干扰了梯度计算
+解决: 确保使用最新版本，可视化使用延迟执行策略
 
 ### 问题: 生成的图过大无法打开
 解决: 
