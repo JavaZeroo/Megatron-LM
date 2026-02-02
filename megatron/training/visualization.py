@@ -413,18 +413,33 @@ class MegatronGraphVisualizer:
                 output_path = self._get_output_path(iteration, chunk_id) + ".onnx"
                 
                 # 导出 ONNX
+                # 注意：使用 dynamo=False 禁用新的 dynamo-based exporter，
+                # 因为 Megatron-LM 的动态特性（如 RNG state、动态形状）与 dynamo 不兼容
                 try:
+                    # 检查 PyTorch 版本以决定使用哪种导出方式
+                    torch_version = tuple(int(x) for x in torch.__version__.split('.')[:2])
+                    
+                    export_kwargs = {
+                        'input_names': input_names,
+                        'output_names': ['output'],
+                        'opset_version': self.opset_version,
+                        'do_constant_folding': True,
+                        'export_params': True,
+                        'verbose': False,
+                    }
+                    
+                    # PyTorch 2.0+ 支持 dynamo 参数，需要显式禁用
+                    if torch_version >= (2, 0):
+                        export_kwargs['dynamo'] = False
+                    
+                    # 对于复杂模型，不使用 dynamic_axes 以避免兼容性问题
+                    # dynamic_axes 在 Megatron-LM 中容易引起问题
+                    
                     torch.onnx.export(
                         unwrapped,
                         dummy_inputs,
                         output_path,
-                        input_names=input_names,
-                        output_names=['output'],
-                        dynamic_axes=dynamic_axes,
-                        opset_version=self.opset_version,
-                        do_constant_folding=True,
-                        export_params=True,
-                        verbose=False,
+                        **export_kwargs,
                     )
                     
                     self._print_rank_0(
@@ -444,18 +459,56 @@ class MegatronGraphVisualizer:
                             
                 except Exception as e:
                     self._print_rank_0(f"ONNX export failed: {e}")
-                    # 尝试使用 TorchScript 作为后备
+                    # 尝试多种后备方案
+                    fallback_success = False
+                    
+                    # 后备方案 1: 使用 torch.jit.script（比 trace 更适合动态模型）
                     try:
                         ts_path = self._get_output_path(iteration, chunk_id) + ".pt"
-                        traced_model = torch.jit.trace(unwrapped, dummy_inputs)
-                        traced_model.save(ts_path)
+                        # 尝试 script 而不是 trace，对动态模型更友好
+                        scripted_model = torch.jit.script(unwrapped)
+                        scripted_model.save(ts_path)
                         self._print_rank_0(
-                            f"[Rank {state['global_rank']}] TorchScript model saved (ONNX failed): {ts_path}\n"
+                            f"[Rank {state['global_rank']}] TorchScript model saved: {ts_path}\n"
                             f"  View with Netron: https://netron.app"
                         )
                         generated_files.append(ts_path)
+                        fallback_success = True
                     except Exception as e2:
-                        self._print_rank_0(f"TorchScript export also failed: {e2}")
+                        self._print_rank_0(f"TorchScript script failed: {e2}")
+                        
+                        # 后备方案 2: 保存模型结构和参数信息为文本文件
+                        try:
+                            info_path = self._get_output_path(iteration, chunk_id) + "_model_info.txt"
+                            with open(info_path, 'w') as f:
+                                f.write(f"Megatron-LM Model Structure\n")
+                                f.write(f"Iteration: {iteration}\n")
+                                f.write(f"PP Stage: {state['pp_rank']}\n")
+                                f.write(f"=" * 80 + "\n\n")
+                                
+                                # 模型结构
+                                f.write("Model Architecture:\n")
+                                f.write("-" * 40 + "\n")
+                                f.write(str(unwrapped) + "\n\n")
+                                
+                                # 参数统计
+                                f.write("Parameters:\n")
+                                f.write("-" * 40 + "\n")
+                                total_params = 0
+                                for name, param in unwrapped.named_parameters():
+                                    param_count = param.numel()
+                                    total_params += param_count
+                                    f.write(f"{name}: {list(param.shape)} ({param_count:,} params)\n")
+                                f.write(f"\nTotal parameters: {total_params:,}\n")
+                                
+                            self._print_rank_0(
+                                f"[Rank {state['global_rank']}] Model info saved: {info_path}\n"
+                                f"  (ONNX/TorchScript export not supported for this model)"
+                            )
+                            generated_files.append(info_path)
+                            fallback_success = True
+                        except Exception as e3:
+                            self._print_rank_0(f"All export methods failed: {e3}")
                 
                 # 恢复训练状态
                 if was_training:
