@@ -462,22 +462,39 @@ class MegatronGraphVisualizer:
                     # 尝试多种后备方案
                     fallback_success = False
                     
-                    # 后备方案 1: 使用 torch.jit.script（比 trace 更适合动态模型）
+                    # 后备方案 1: 保存为 state_dict 格式（Netron 支持查看）
                     try:
-                        ts_path = self._get_output_path(iteration, chunk_id) + ".pt"
-                        # 尝试 script 而不是 trace，对动态模型更友好
-                        scripted_model = torch.jit.script(unwrapped)
-                        scripted_model.save(ts_path)
+                        pt_path = self._get_output_path(iteration, chunk_id) + ".pt"
+                        # 保存完整模型（包括结构和权重），Netron 可以打开
+                        torch.save(unwrapped, pt_path)
                         self._print_rank_0(
-                            f"[Rank {state['global_rank']}] TorchScript model saved: {ts_path}\n"
-                            f"  View with Netron: https://netron.app"
+                            f"[Rank {state['global_rank']}] PyTorch model saved: {pt_path}\n"
+                            f"  View with Netron: https://netron.app (drag and drop the .pt file)"
                         )
-                        generated_files.append(ts_path)
+                        generated_files.append(pt_path)
                         fallback_success = True
                     except Exception as e2:
-                        self._print_rank_0(f"TorchScript script failed: {e2}")
+                        self._print_rank_0(f"PyTorch save failed: {e2}")
                         
-                        # 后备方案 2: 保存模型结构和参数信息为文本文件
+                        # 后备方案 2: 只保存 state_dict
+                        try:
+                            sd_path = self._get_output_path(iteration, chunk_id) + "_state_dict.pt"
+                            torch.save({
+                                'model_state_dict': unwrapped.state_dict(),
+                                'model_class': unwrapped.__class__.__name__,
+                                'iteration': iteration,
+                                'pp_rank': state['pp_rank'],
+                            }, sd_path)
+                            self._print_rank_0(
+                                f"[Rank {state['global_rank']}] State dict saved: {sd_path}"
+                            )
+                            generated_files.append(sd_path)
+                            fallback_success = True
+                        except Exception as e3:
+                            self._print_rank_0(f"State dict save failed: {e3}")
+                    
+                    # 后备方案 3: 保存模型结构信息为文本文件（始终尝试）
+                    if not fallback_success:
                         try:
                             info_path = self._get_output_path(iteration, chunk_id) + "_model_info.txt"
                             with open(info_path, 'w') as f:
@@ -506,9 +523,8 @@ class MegatronGraphVisualizer:
                                 f"  (ONNX/TorchScript export not supported for this model)"
                             )
                             generated_files.append(info_path)
-                            fallback_success = True
-                        except Exception as e3:
-                            self._print_rank_0(f"All export methods failed: {e3}")
+                        except Exception as e4:
+                            self._print_rank_0(f"All export methods failed: {e4}")
                 
                 # 恢复训练状态
                 if was_training:
