@@ -3,16 +3,19 @@
 """
 Megatron-LM 计算图可视化集成模块
 
-此模块提供将模型导出为 ONNX 格式，以便使用 Netron 进行可视化。
-它可以在训练的指定步骤捕获模型并生成 ONNX 文件。
+此模块提供模型结构可视化功能，生成 Graphviz DOT 格式的图形文件。
+由于 Megatron-LM 的分布式特性，无法直接导出 ONNX/TorchScript，
+因此使用基于模块层次结构的可视化方式。
 
-Netron 是一个强大的神经网络可视化工具，支持查看 ONNX、PyTorch 等多种格式。
-- 在线版本：https://netron.app
-- 桌面版本：https://github.com/lutzroeder/netron
+生成的文件：
+- .dot 文件：Graphviz 格式，可以用在线查看器或 graphviz 工具查看
+- .svg 文件：矢量图形（需要安装 graphviz 库）
+- _stats.txt 文件：模型参数统计信息
 
-重要：可视化使用"延迟执行"策略 - 在 forward 时保存模型信息，
-在反向传播完成后（train_step 结束时）再导出 ONNX 文件，
-以避免干扰训练过程中的梯度计算。
+查看方式：
+- 在线 Graphviz 查看器：https://dreampuf.github.io/GraphvizOnline/
+- 安装 graphviz：pip install graphviz
+- SVG 文件可直接用浏览器打开
 
 使用示例：
     # 在 pretrain_gpt.py 或其他预训练脚本中：
@@ -31,11 +34,6 @@ Netron 是一个强大的神经网络可视化工具，支持查看 ONNX、PyTor
     
     # 在 train_step 结束后生成可视化
     finalize_visualization(iteration)
-    
-    # 生成的 .onnx 文件可以用 Netron 打开：
-    # 1. 在线：上传到 https://netron.app
-    # 2. 命令行：netron model_graph.onnx
-    # 3. 桌面应用：直接双击打开
 """
 
 import os
@@ -59,23 +57,23 @@ except ImportError:
 
 class MegatronGraphVisualizer:
     """
-    专门为 Megatron-LM 设计的计算图可视化器。
+    专门为 Megatron-LM 设计的模型结构可视化器。
     
-    使用 ONNX 导出模型，然后可以用 Netron 查看。
+    使用 Graphviz DOT 格式生成模型层次结构图。
     
     使用延迟执行策略：
-    1. capture_graph() - 在 forward 时保存模型参数名称映射
-    2. finalize() - 在反向传播完成后，导出 ONNX 文件
+    1. capture_graph() - 在 forward 时保存模型引用
+    2. finalize() - 在反向传播完成后，生成可视化文件
     
     支持：
     - 分布式训练（数据并行、张量并行、流水线并行）
     - 虚拟流水线并行
     - 各种模型包装器（DDP, Float16Module 等）
     
-    生成的 ONNX 文件可以用 Netron 打开：
-    - 在线：https://netron.app
-    - 命令行：netron model_graph.onnx
-    - 桌面应用：直接双击打开
+    生成的文件：
+    - .dot 文件：https://dreampuf.github.io/GraphvizOnline/ 在线查看
+    - .svg 文件：浏览器直接打开（需安装 graphviz）
+    - _stats.txt：参数统计信息
     """
     
     _instance = None
@@ -299,10 +297,16 @@ class MegatronGraphVisualizer:
         """
         完成可视化 - 在反向传播完成后调用。
         
-        此方法将模型导出为 ONNX 格式，可以使用 Netron 查看。
+        由于 Megatron-LM 的分布式特性，无法直接导出 ONNX/TorchScript。
+        此方法改为生成模型结构的 DOT 格式可视化文件。
+        
+        生成的文件可以用以下方式查看：
+        - DOT 文件：使用 Graphviz 或在线查看器 https://dreampuf.github.io/GraphvizOnline/
+        - SVG 文件：直接用浏览器打开
+        - PNG 文件：直接查看图片
         
         Returns:
-            生成的 ONNX 文件路径列表
+            生成的文件路径列表
         """
         if self._pending_visualization is None:
             return []
@@ -325,215 +329,16 @@ class MegatronGraphVisualizer:
             try:
                 unwrapped = self._unwrap_model(model_chunk)
                 
-                # 获取模型配置以创建正确大小的虚拟输入
-                device = next(unwrapped.parameters()).device
-                dtype = next(unwrapped.parameters()).dtype
-                
-                # 使用虚拟输入进行 ONNX 导出
-                batch_size = 1
-                seq_length = 32  # 使用较小的序列长度以节省内存
-                vocab_size = 151936  # 默认词汇表大小
-                
-                # 尝试从模型获取实际配置
-                try:
-                    if hasattr(unwrapped, 'config'):
-                        config = unwrapped.config
-                        if hasattr(config, 'vocab_size'):
-                            vocab_size = config.vocab_size
-                except Exception:
-                    pass
-                
-                # 保存原始训练状态
-                was_training = unwrapped.training
-                unwrapped.eval()
-                
-                # 创建虚拟输入
-                input_ids = torch.randint(
-                    0, vocab_size, (batch_size, seq_length), 
-                    device=device, dtype=torch.long
+                # 生成模型结构可视化
+                output_path = self._get_output_path(iteration, chunk_id)
+                files = self._generate_module_graph(
+                    unwrapped, 
+                    output_path, 
+                    iteration, 
+                    state,
+                    max_depth=self.max_depth,
                 )
-                position_ids = torch.arange(
-                    seq_length, device=device, dtype=torch.long
-                ).unsqueeze(0)
-                attention_mask = torch.ones(
-                    batch_size, 1, seq_length, seq_length,
-                    device=device, dtype=torch.bool
-                )
-                
-                # 确定模型的输入格式
-                dummy_inputs = None
-                input_names = None
-                dynamic_axes = None
-                
-                try:
-                    # 尝试使用关键字参数
-                    with torch.no_grad():
-                        _ = unwrapped(
-                            input_ids=input_ids,
-                            position_ids=position_ids,
-                            attention_mask=attention_mask,
-                        )
-                    dummy_inputs = (input_ids, position_ids, attention_mask)
-                    input_names = ['input_ids', 'position_ids', 'attention_mask']
-                    dynamic_axes = {
-                        'input_ids': {0: 'batch_size', 1: 'seq_length'},
-                        'position_ids': {0: 'batch_size', 1: 'seq_length'},
-                        'attention_mask': {0: 'batch_size', 2: 'seq_length', 3: 'seq_length'},
-                        'output': {0: 'batch_size', 1: 'seq_length'},
-                    }
-                except TypeError:
-                    try:
-                        with torch.no_grad():
-                            _ = unwrapped(input_ids, position_ids, attention_mask)
-                        dummy_inputs = (input_ids, position_ids, attention_mask)
-                        input_names = ['input_ids', 'position_ids', 'attention_mask']
-                        dynamic_axes = {
-                            'input_ids': {0: 'batch_size', 1: 'seq_length'},
-                            'position_ids': {0: 'batch_size', 1: 'seq_length'},
-                            'attention_mask': {0: 'batch_size'},
-                            'output': {0: 'batch_size'},
-                        }
-                    except TypeError:
-                        try:
-                            with torch.no_grad():
-                                _ = unwrapped(input_ids)
-                            dummy_inputs = (input_ids,)
-                            input_names = ['input_ids']
-                            dynamic_axes = {
-                                'input_ids': {0: 'batch_size', 1: 'seq_length'},
-                                'output': {0: 'batch_size', 1: 'seq_length'},
-                            }
-                        except Exception as e:
-                            self._print_rank_0(f"Could not determine model input format: {e}")
-                            if was_training:
-                                unwrapped.train()
-                            continue
-                
-                # 生成输出路径
-                output_path = self._get_output_path(iteration, chunk_id) + ".onnx"
-                
-                # 导出 ONNX
-                # 注意：使用 dynamo=False 禁用新的 dynamo-based exporter，
-                # 因为 Megatron-LM 的动态特性（如 RNG state、动态形状）与 dynamo 不兼容
-                try:
-                    # 检查 PyTorch 版本以决定使用哪种导出方式
-                    torch_version = tuple(int(x) for x in torch.__version__.split('.')[:2])
-                    
-                    export_kwargs = {
-                        'input_names': input_names,
-                        'output_names': ['output'],
-                        'opset_version': self.opset_version,
-                        'do_constant_folding': True,
-                        'export_params': True,
-                        'verbose': False,
-                    }
-                    
-                    # PyTorch 2.0+ 支持 dynamo 参数，需要显式禁用
-                    if torch_version >= (2, 0):
-                        export_kwargs['dynamo'] = False
-                    
-                    # 对于复杂模型，不使用 dynamic_axes 以避免兼容性问题
-                    # dynamic_axes 在 Megatron-LM 中容易引起问题
-                    
-                    torch.onnx.export(
-                        unwrapped,
-                        dummy_inputs,
-                        output_path,
-                        **export_kwargs,
-                    )
-                    
-                    self._print_rank_0(
-                        f"[Rank {state['global_rank']}] ONNX model exported: {output_path}\n"
-                        f"  View with Netron: https://netron.app or run 'netron {output_path}'"
-                    )
-                    generated_files.append(output_path)
-                    
-                    # 可选：验证导出的模型
-                    if HAVE_ONNX:
-                        try:
-                            onnx_model = onnx.load(output_path)
-                            onnx.checker.check_model(onnx_model)
-                            self._print_rank_0(f"  ONNX model validation passed")
-                        except Exception as e:
-                            self._print_rank_0(f"  ONNX validation warning: {e}")
-                            
-                except Exception as e:
-                    self._print_rank_0(f"ONNX export failed: {e}")
-                    # 尝试多种后备方案
-                    fallback_success = False
-                    
-                    # 后备方案 1: 保存为 state_dict 格式（Netron 支持查看）
-                    try:
-                        pt_path = self._get_output_path(iteration, chunk_id) + ".pt"
-                        # 保存完整模型（包括结构和权重），Netron 可以打开
-                        torch.save(unwrapped, pt_path)
-                        self._print_rank_0(
-                            f"[Rank {state['global_rank']}] PyTorch model saved: {pt_path}\n"
-                            f"  View with Netron: https://netron.app (drag and drop the .pt file)"
-                        )
-                        generated_files.append(pt_path)
-                        fallback_success = True
-                    except Exception as e2:
-                        self._print_rank_0(f"PyTorch save failed: {e2}")
-                        
-                        # 后备方案 2: 只保存 state_dict
-                        try:
-                            sd_path = self._get_output_path(iteration, chunk_id) + "_state_dict.pt"
-                            torch.save({
-                                'model_state_dict': unwrapped.state_dict(),
-                                'model_class': unwrapped.__class__.__name__,
-                                'iteration': iteration,
-                                'pp_rank': state['pp_rank'],
-                            }, sd_path)
-                            self._print_rank_0(
-                                f"[Rank {state['global_rank']}] State dict saved: {sd_path}"
-                            )
-                            generated_files.append(sd_path)
-                            fallback_success = True
-                        except Exception as e3:
-                            self._print_rank_0(f"State dict save failed: {e3}")
-                    
-                    # 后备方案 3: 保存模型结构信息为文本文件（始终尝试）
-                    if not fallback_success:
-                        try:
-                            info_path = self._get_output_path(iteration, chunk_id) + "_model_info.txt"
-                            with open(info_path, 'w') as f:
-                                f.write(f"Megatron-LM Model Structure\n")
-                                f.write(f"Iteration: {iteration}\n")
-                                f.write(f"PP Stage: {state['pp_rank']}\n")
-                                f.write(f"=" * 80 + "\n\n")
-                                
-                                # 模型结构
-                                f.write("Model Architecture:\n")
-                                f.write("-" * 40 + "\n")
-                                f.write(str(unwrapped) + "\n\n")
-                                
-                                # 参数统计
-                                f.write("Parameters:\n")
-                                f.write("-" * 40 + "\n")
-                                total_params = 0
-                                for name, param in unwrapped.named_parameters():
-                                    param_count = param.numel()
-                                    total_params += param_count
-                                    f.write(f"{name}: {list(param.shape)} ({param_count:,} params)\n")
-                                f.write(f"\nTotal parameters: {total_params:,}\n")
-                                
-                            self._print_rank_0(
-                                f"[Rank {state['global_rank']}] Model info saved: {info_path}\n"
-                                f"  (ONNX/TorchScript export not supported for this model)"
-                            )
-                            generated_files.append(info_path)
-                        except Exception as e4:
-                            self._print_rank_0(f"All export methods failed: {e4}")
-                
-                # 恢复训练状态
-                if was_training:
-                    unwrapped.train()
-                
-                # 清理
-                gc.collect()
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
+                generated_files.extend(files)
                 
             except Exception as e:
                 self._print_rank_0(f"[Rank {state['global_rank']}] Error exporting model chunk {chunk_id}: {e}")
@@ -542,6 +347,217 @@ class MegatronGraphVisualizer:
         
         if generated_files:
             self._visualized_iterations.add(iteration)
+        
+        return generated_files
+    
+    def _generate_module_graph(
+        self, 
+        model: nn.Module, 
+        output_path: str, 
+        iteration: int,
+        state: dict,
+        max_depth: Optional[int] = None,
+    ) -> List[str]:
+        """
+        生成模块层次结构的可视化图。
+        
+        Args:
+            model: PyTorch 模型
+            output_path: 输出文件路径（不含扩展名）
+            iteration: 当前迭代
+            state: 并行状态信息
+            max_depth: 最大深度限制
+            
+        Returns:
+            生成的文件路径列表
+        """
+        generated_files = []
+        
+        # 构建 DOT 格式的图
+        dot_lines = [
+            'digraph MegatronModel {',
+            '    rankdir=TB;',
+            '    node [shape=box, style="rounded,filled", fontname="Helvetica"];',
+            '    edge [fontname="Helvetica", fontsize=10];',
+            f'    label="Megatron-LM Model Structure\\nIteration: {iteration}, PP Stage: {state["pp_rank"]}";',
+            '    labelloc=t;',
+            '    fontsize=16;',
+            '',
+        ]
+        
+        # 用于存储节点和边
+        node_id = [0]  # 使用列表以便在嵌套函数中修改
+        edges = []
+        
+        # 定义层类型的颜色
+        layer_colors = {
+            'Embedding': '#E8F5E9',  # 浅绿
+            'Linear': '#E3F2FD',      # 浅蓝
+            'LayerNorm': '#FFF3E0',   # 浅橙
+            'RMSNorm': '#FFF3E0',     # 浅橙
+            'Attention': '#FCE4EC',   # 浅粉
+            'MLP': '#F3E5F5',         # 浅紫
+            'Dropout': '#ECEFF1',     # 浅灰
+            'Transformer': '#E1F5FE', # 浅青
+            'default': '#FFFFFF',     # 白色
+        }
+        
+        def get_color(class_name: str) -> str:
+            for key, color in layer_colors.items():
+                if key.lower() in class_name.lower():
+                    return color
+            return layer_colors['default']
+        
+        def get_param_info(module: nn.Module) -> str:
+            """获取模块的参数信息"""
+            params = list(module.parameters(recurse=False))
+            if not params:
+                return ""
+            total = sum(p.numel() for p in params)
+            if total >= 1e9:
+                return f"\\n{total/1e9:.2f}B params"
+            elif total >= 1e6:
+                return f"\\n{total/1e6:.2f}M params"
+            elif total >= 1e3:
+                return f"\\n{total/1e3:.2f}K params"
+            else:
+                return f"\\n{total} params"
+        
+        def add_module(
+            module: nn.Module, 
+            name: str, 
+            parent_id: Optional[int], 
+            depth: int
+        ) -> int:
+            """递归添加模块到图中"""
+            if max_depth is not None and depth > max_depth:
+                return -1
+            
+            current_id = node_id[0]
+            node_id[0] += 1
+            
+            class_name = module.__class__.__name__
+            color = get_color(class_name)
+            param_info = get_param_info(module)
+            
+            # 获取额外信息
+            extra_info = ""
+            if hasattr(module, 'in_features') and hasattr(module, 'out_features'):
+                extra_info = f"\\n({module.in_features} → {module.out_features})"
+            elif hasattr(module, 'num_embeddings') and hasattr(module, 'embedding_dim'):
+                extra_info = f"\\n({module.num_embeddings} × {module.embedding_dim})"
+            elif hasattr(module, 'normalized_shape'):
+                shape = module.normalized_shape
+                if isinstance(shape, (list, tuple)):
+                    extra_info = f"\\n{list(shape)}"
+                else:
+                    extra_info = f"\\n[{shape}]"
+            
+            label = f"{name}\\n({class_name}){extra_info}{param_info}"
+            
+            dot_lines.append(
+                f'    node{current_id} [label="{label}", fillcolor="{color}"];'
+            )
+            
+            if parent_id is not None:
+                edges.append((parent_id, current_id))
+            
+            # 递归处理子模块
+            children = list(module.named_children())
+            for child_name, child_module in children:
+                add_module(child_module, child_name, current_id, depth + 1)
+            
+            return current_id
+        
+        # 从根模块开始
+        add_module(model, model.__class__.__name__, None, 0)
+        
+        # 添加边
+        dot_lines.append('')
+        for src, dst in edges:
+            dot_lines.append(f'    node{src} -> node{dst};')
+        
+        dot_lines.append('}')
+        
+        dot_content = '\n'.join(dot_lines)
+        
+        # 保存 DOT 文件
+        dot_path = output_path + ".dot"
+        with open(dot_path, 'w', encoding='utf-8') as f:
+            f.write(dot_content)
+        generated_files.append(dot_path)
+        
+        # 尝试使用 graphviz 生成图片
+        try:
+            import graphviz
+            graph = graphviz.Source(dot_content)
+            # 生成 SVG（可以用浏览器打开，支持缩放）
+            svg_path = graph.render(output_path, format='svg', cleanup=True)
+            generated_files.append(svg_path)
+            self._print_rank_0(
+                f"[Rank {state['global_rank']}] Model graph saved:\n"
+                f"  SVG: {svg_path} (open in browser)\n"
+                f"  DOT: {dot_path} (use https://dreampuf.github.io/GraphvizOnline/)"
+            )
+        except ImportError:
+            self._print_rank_0(
+                f"[Rank {state['global_rank']}] Model graph saved: {dot_path}\n"
+                f"  View online: https://dreampuf.github.io/GraphvizOnline/\n"
+                f"  Or install graphviz: pip install graphviz"
+            )
+        except Exception as e:
+            self._print_rank_0(
+                f"[Rank {state['global_rank']}] DOT file saved: {dot_path}\n"
+                f"  (graphviz rendering failed: {e})\n"
+                f"  View online: https://dreampuf.github.io/GraphvizOnline/"
+            )
+        
+        # 同时保存模型参数统计
+        stats_path = output_path + "_stats.txt"
+        try:
+            with open(stats_path, 'w', encoding='utf-8') as f:
+                f.write(f"Megatron-LM Model Statistics\n")
+                f.write(f"Iteration: {iteration}\n")
+                f.write(f"PP Stage: {state['pp_rank']}\n")
+                f.write(f"=" * 80 + "\n\n")
+                
+                # 模型概览
+                f.write("Model Overview:\n")
+                f.write("-" * 40 + "\n")
+                f.write(f"Model Class: {model.__class__.__name__}\n")
+                
+                total_params = sum(p.numel() for p in model.parameters())
+                trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+                f.write(f"Total Parameters: {total_params:,} ({total_params/1e6:.2f}M)\n")
+                f.write(f"Trainable Parameters: {trainable_params:,} ({trainable_params/1e6:.2f}M)\n\n")
+                
+                # 按层类型统计
+                f.write("Parameters by Layer Type:\n")
+                f.write("-" * 40 + "\n")
+                layer_stats = {}
+                for name, module in model.named_modules():
+                    class_name = module.__class__.__name__
+                    params = sum(p.numel() for p in module.parameters(recurse=False))
+                    if params > 0:
+                        if class_name not in layer_stats:
+                            layer_stats[class_name] = {'count': 0, 'params': 0}
+                        layer_stats[class_name]['count'] += 1
+                        layer_stats[class_name]['params'] += params
+                
+                for class_name, stats in sorted(layer_stats.items(), key=lambda x: -x[1]['params']):
+                    f.write(f"  {class_name}: {stats['count']} layers, {stats['params']:,} params\n")
+                
+                f.write("\n")
+                
+                # 详细参数列表
+                f.write("All Parameters:\n")
+                f.write("-" * 40 + "\n")
+                for name, param in model.named_parameters():
+                    f.write(f"  {name}: {list(param.shape)} ({param.numel():,})\n")
+                
+            generated_files.append(stats_path)
+        except Exception as e:
+            self._print_rank_0(f"Failed to save stats: {e}")
         
         return generated_files
     
@@ -647,10 +663,10 @@ def setup_model_graph_visualization(args) -> Optional[MegatronGraphVisualizer]:
     """
     从 Megatron 参数设置可视化。
     
-    生成的 ONNX 文件可以使用 Netron 查看：
-    - 在线：https://netron.app
-    - 桌面应用：https://github.com/lutzroeder/netron
-    - 命令行：pip install netron && netron model.onnx
+    生成的文件：
+    - .dot 文件：在线查看 https://dreampuf.github.io/GraphvizOnline/
+    - .svg 文件：浏览器直接打开（需安装 pip install graphviz）
+    - _stats.txt：参数统计信息
     
     Args:
         args: Megatron 命令行参数
@@ -660,9 +676,6 @@ def setup_model_graph_visualization(args) -> Optional[MegatronGraphVisualizer]:
     """
     if not getattr(args, 'visualize_model_graph', False):
         return None
-    
-    # ONNX 导出使用 PyTorch 内置功能，无需额外依赖
-    # 可选安装 onnx 库用于验证：pip install onnx
     
     # 解析迭代步骤
     iterations_str = getattr(args, 'visualize_graph_iterations', "1")
@@ -675,13 +688,16 @@ def setup_model_graph_visualization(args) -> Optional[MegatronGraphVisualizer]:
     if output_dir is None:
         output_dir = "./checkpoints"
     
+    # 获取最大深度限制
+    max_depth = getattr(args, 'visualize_graph_max_depth', None)
+    
     return MegatronGraphVisualizer.initialize(
         output_dir=output_dir,
         iterations_to_visualize=iterations,
         visualize_interval=getattr(args, 'visualize_graph_interval', None),
-        output_format='onnx',  # 始终使用 ONNX 格式
+        output_format='dot',
         include_shapes=True,
-        opset_version=getattr(args, 'visualize_graph_opset_version', 14),
+        max_depth=max_depth,
     )
 
 
