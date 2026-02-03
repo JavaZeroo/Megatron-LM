@@ -44,7 +44,10 @@ from megatron.training import (
     set_startup_timestamps,
 )
 from megatron.training.datasets.sft_dataset import SFTDataset
-from megatron.training.compute_graph import maybe_tag_compute_graph_inputs
+from megatron.training.compute_graph import (
+    maybe_record_compute_graph_outputs,
+    maybe_tag_compute_graph_inputs,
+)
 from megatron.training.utils import (
     get_batch_on_this_cp_rank,
     get_batch_on_this_tp_rank,
@@ -268,6 +271,7 @@ def forward_step(data_iterator, model: MambaModel):
             packed_seq_params=packed_seq_params,
         )
 
+    maybe_record_compute_graph_outputs(args, output_tensor)
     # [ModelOpt]: model is needed to access ModelOpt distillation losses
     return output_tensor, partial(loss_func, loss_mask, model=model)
 

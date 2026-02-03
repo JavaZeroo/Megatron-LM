@@ -43,7 +43,10 @@ from megatron.training.datasets.sft_dataset import SFTDataset
 from megatron.core.transformer.multi_token_prediction import mtp_on_this_rank, get_mtp_ranks
 from megatron.training.arguments import core_transformer_config_from_args
 from megatron.training.datasets.fim_dataset import GPTFIMDataset, GPTFIMDatasetConfig
-from megatron.training.compute_graph import maybe_tag_compute_graph_inputs
+from megatron.training.compute_graph import (
+    maybe_record_compute_graph_outputs,
+    maybe_tag_compute_graph_inputs,
+)
 from megatron.training.utils import (
     get_batch_on_this_cp_rank,
     get_batch_on_this_tp_rank,
@@ -206,6 +209,7 @@ def forward_step(data_iterator, model: GPTModel, return_schedule_plan: bool = Fa
                     tokens, position_ids, attention_mask, labels=labels, loss_mask=loss_mask, packed_seq_params=packed_seq_params
                 )
 
+    maybe_record_compute_graph_outputs(args, output_tensor)
     # [ModelOpt]: model is needed to access ModelOpt distillation losses
     return output_tensor, partial(loss_func, loss_mask, model=model)
 

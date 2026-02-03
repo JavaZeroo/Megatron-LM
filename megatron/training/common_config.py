@@ -69,6 +69,9 @@ class ComputeGraphConfig:
     compute_graph_format: str = "svg"
     """Output format for rendered graphs (e.g., svg, png, pdf, dot)."""
 
+    compute_graph_mode: str = "both"
+    """Graph detail level: module, autograd, or both."""
+
     compute_graph_ranks: list[int] = field(default_factory=lambda: [0])
     """Global ranks that will export the graph."""
 

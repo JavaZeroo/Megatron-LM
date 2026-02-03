@@ -7,7 +7,10 @@ import numpy as np
 import torch.distributed as dist
 from functools import partial
 from megatron.training import get_args, get_timers, print_rank_0
-from megatron.training.compute_graph import maybe_tag_compute_graph_inputs
+from megatron.training.compute_graph import (
+    maybe_record_compute_graph_outputs,
+    maybe_tag_compute_graph_inputs,
+)
 from megatron.core.enums import ModelType
 from megatron.legacy.data.vit_dataset import build_train_valid_datasets
 from megatron.legacy.model.vision.dino import DINOPretrainModel
@@ -81,7 +84,9 @@ def forward_step(data_iterator, model):
         labels=labels,
     )
 
-    return model(images), partial(loss_func, model, labels)
+    output_tensor = model(images)
+    maybe_record_compute_graph_outputs(args, output_tensor)
+    return output_tensor, partial(loss_func, model, labels)
 
 
 def train_valid_test_datasets_provider(train_val_test_num_samples):

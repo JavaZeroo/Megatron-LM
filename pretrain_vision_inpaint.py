@@ -6,7 +6,10 @@ import torch
 import torch.nn.functional as F
 from functools import partial
 from megatron.training import get_args, get_timers, print_rank_0, print_rank_last
-from megatron.training.compute_graph import maybe_tag_compute_graph_inputs
+from megatron.training.compute_graph import (
+    maybe_record_compute_graph_outputs,
+    maybe_tag_compute_graph_inputs,
+)
 from megatron.core.enums import ModelType
 from megatron.legacy.data.vit_dataset import build_train_valid_datasets
 from megatron.legacy.model.vision.inpainting import VitInpaintingModel
@@ -99,6 +102,7 @@ def forward_step(data_iterator, model):
     masked_images = images.masked_fill(masks.bool(), 0)
     outputs = model(masked_images)
 
+    maybe_record_compute_graph_outputs(args, outputs)
     # Forward mode
     return outputs, partial(loss_func, images, masks, masked_images)
 

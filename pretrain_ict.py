@@ -19,7 +19,10 @@ from megatron.legacy.data.dataset_utils import build_train_valid_test_datasets
 from megatron.legacy.model.biencoder_model import biencoder_model_provider
 from megatron.training import pretrain
 from megatron.training.utils import average_losses_across_data_parallel_group
-from megatron.training.compute_graph import maybe_tag_compute_graph_inputs
+from megatron.training.compute_graph import (
+    maybe_record_compute_graph_outputs,
+    maybe_tag_compute_graph_inputs,
+)
 
 
 def pretrain_ict_model_provider(pre_process=True, post_process=True):
@@ -142,6 +145,7 @@ def forward_step(data_iterator, model):
     output_tensor = model(query_tokens, query_mask, query_types, context_tokens,
                         context_mask, context_types)
 
+    maybe_record_compute_graph_outputs(args, output_tensor)
     return output_tensor, partial(loss_func)
 
 def train_valid_test_datasets_provider(train_val_test_num_samples):

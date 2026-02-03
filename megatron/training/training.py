@@ -116,6 +116,7 @@ from megatron.training.compute_graph import (
     ComputeGraphSettings,
     ComputeGraphTracer,
     mark_compute_graph_captured,
+    set_active_compute_graph_tracer,
     should_capture_compute_graph,
 )
 
@@ -1636,8 +1637,10 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
             output_dir=args.compute_graph_output_dir,
             file_prefix=file_prefix,
             file_format=args.compute_graph_format,
+            mode=args.compute_graph_mode,
         )
         graph_tracer = ComputeGraphTracer(settings)
+        set_active_compute_graph_tracer(graph_tracer)
         for chunk_index, model_chunk in enumerate(model):
             graph_tracer.register_model(model_chunk, prefix=f"chunk{chunk_index}.")
     while rerun_state_machine.should_run_forward_backward(data_iterator):
@@ -1698,6 +1701,7 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
             graph_tracer.write_graphs()
             graph_tracer.close()
             mark_compute_graph_captured()
+            set_active_compute_graph_tracer(None)
             graph_tracer = None
 
         # Reset force_all_reduce field.
