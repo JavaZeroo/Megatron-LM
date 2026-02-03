@@ -95,10 +95,8 @@ class ComputeGraphTracer:
             mode=normalized_mode,
         )
         self.forward_edges: set[tuple[str, str]] = set()
-        self.backward_edges: set[tuple[str, str]] = set()
         self.autograd_edges: set[tuple[str, str]] = set()
         self._tensor_producer: dict[int, str] = {}
-        self._grad_producer: dict[int, str] = {}
         self._input_counter = 0
         self._handles: list[torch.utils.hooks.RemovableHandle] = []
         self._module_names: dict[torch.nn.Module, str] = {}
@@ -113,14 +111,11 @@ class ComputeGraphTracer:
             module_name = f"{prefix}{name}" if prefix else name
             self._module_names[module] = module_name
             self._handles.append(module.register_forward_hook(self._forward_hook))
-            self._handles.append(module.register_full_backward_hook(self._backward_hook))
 
     def clear(self) -> None:
         self.forward_edges.clear()
-        self.backward_edges.clear()
         self.autograd_edges.clear()
         self._tensor_producer.clear()
-        self._grad_producer.clear()
         self._input_counter = 0
         self._output_tensors.clear()
 
@@ -157,19 +152,6 @@ class ComputeGraphTracer:
             self.forward_edges.add((source, module_name))
         for tensor in _iter_tensors(output):
             self._tensor_producer[id(tensor)] = module_name
-
-    def _backward_hook(
-        self,
-        module: torch.nn.Module,
-        grad_input: tuple[Any, ...],
-        grad_output: tuple[Any, ...],
-    ) -> None:
-        module_name = self._module_names.get(module, module.__class__.__name__)
-        for tensor in _iter_tensors(grad_output):
-            source = self._grad_producer.get(id(tensor), "loss")
-            self.backward_edges.add((source, module_name))
-        for tensor in _iter_tensors(grad_input):
-            self._grad_producer[id(tensor)] = module_name
 
     def record_outputs(self, output: Any) -> None:
         for tensor in _iter_tensors(output):
@@ -233,18 +215,10 @@ class ComputeGraphTracer:
             forward_dot = output_dir / f"{self.settings.file_prefix}_forward.dot"
             self._write_dot(self.forward_edges, forward_dot)
             artifacts["forward_dot"] = forward_dot
-
-            backward_dot = output_dir / f"{self.settings.file_prefix}_backward.dot"
-            self._write_dot(self.backward_edges, backward_dot)
-            artifacts["backward_dot"] = backward_dot
-
             if self.settings.file_format != "dot":
                 forward_render = output_dir / f"{self.settings.file_prefix}_forward.{self.settings.file_format}"
-                backward_render = output_dir / f"{self.settings.file_prefix}_backward.{self.settings.file_format}"
                 self._render_dot(forward_dot, forward_render)
-                self._render_dot(backward_dot, backward_render)
                 artifacts["forward_render"] = forward_render
-                artifacts["backward_render"] = backward_render
 
         if self.settings.mode in ("autograd", "both"):
             self._build_autograd_edges()
