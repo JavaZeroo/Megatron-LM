@@ -1997,10 +1997,13 @@ def _add_rl_args(parser):
 
 def _add_training_args(parser):
     from megatron.training.training_config import TrainingConfig
-    from megatron.training.common_config import ProfilingConfig
+    from megatron.training.common_config import ComputeGraphConfig, ProfilingConfig
 
     prof_factory = ArgumentGroupFactory(ProfilingConfig, exclude=["record_shapes", "nvtx_ranges"])
-    prof_group = prof_factory.build_group(parser, "profiling")
+    prof_factory.build_group(parser, "profiling")
+
+    graph_factory = ArgumentGroupFactory(ComputeGraphConfig)
+    graph_factory.build_group(parser, "compute graph")
 
     train_factory = ArgumentGroupFactory(TrainingConfig)
     group = train_factory.build_group(parser, "training")

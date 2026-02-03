@@ -44,6 +44,7 @@ from megatron.training import (
     set_startup_timestamps,
 )
 from megatron.training.datasets.sft_dataset import SFTDataset
+from megatron.training.compute_graph import maybe_tag_compute_graph_inputs
 from megatron.training.utils import (
     get_batch_on_this_cp_rank,
     get_batch_on_this_tp_rank,
@@ -215,6 +216,7 @@ def forward_step(data_iterator, model: MambaModel):
         data_iterator : Input data iterator
         model (MambaModel): The GPT Model
     """
+    args = get_args()
     timers = get_timers()
 
     # Get the batch.
@@ -249,6 +251,13 @@ def forward_step(data_iterator, model: MambaModel):
         )
 
     timers('batch-generator').stop()
+    maybe_tag_compute_graph_inputs(
+        args,
+        input_ids=tokens,
+        position_ids=position_ids,
+        attention_mask=attention_mask,
+        labels=labels,
+    )
 
     with stimer:
         output_tensor = model(

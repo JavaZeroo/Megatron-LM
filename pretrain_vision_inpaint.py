@@ -6,6 +6,7 @@ import torch
 import torch.nn.functional as F
 from functools import partial
 from megatron.training import get_args, get_timers, print_rank_0, print_rank_last
+from megatron.training.compute_graph import maybe_tag_compute_graph_inputs
 from megatron.core.enums import ModelType
 from megatron.legacy.data.vit_dataset import build_train_valid_datasets
 from megatron.legacy.model.vision.inpainting import VitInpaintingModel
@@ -79,6 +80,7 @@ def loss_func(images, masks, masked_images, outputs, non_loss_data=False):
 
 def forward_step(data_iterator, model):
     """Forward step."""
+    args = get_args()
     timers = get_timers()
 
     # Get the batch.
@@ -88,6 +90,11 @@ def forward_step(data_iterator, model):
         masks,
     ) = get_batch(data_iterator)
     timers("batch-generator").stop()
+    maybe_tag_compute_graph_inputs(
+        args,
+        pixel_values=images,
+        masks=masks,
+    )
 
     masked_images = images.masked_fill(masks.bool(), 0)
     outputs = model(masked_images)

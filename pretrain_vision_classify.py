@@ -6,6 +6,7 @@ import torch
 import torch.nn.functional as F
 from functools import partial
 from megatron.training import get_args, get_timers, print_rank_0
+from megatron.training.compute_graph import maybe_tag_compute_graph_inputs
 from megatron.core.enums import ModelType
 from megatron.legacy.data.vit_dataset import build_train_valid_datasets
 from megatron.legacy.model.vision.classification import VitClassificationModel
@@ -63,6 +64,7 @@ def loss_func(labels, output_tensor):
 
 def forward_step(data_iterator, model):
     """Forward step."""
+    args = get_args()
     timers = get_timers()
 
     # Get the batch.
@@ -72,6 +74,11 @@ def forward_step(data_iterator, model):
         labels,
     ) = get_batch(data_iterator)
     timers("batch-generator").stop()
+    maybe_tag_compute_graph_inputs(
+        args,
+        pixel_values=images,
+        labels=labels,
+    )
 
     # Forward model. lm_labels
     output_tensor = model(images)

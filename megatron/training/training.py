@@ -112,6 +112,12 @@ from megatron.core.distributed import DistributedDataParallelConfig, TorchFullyS
 from megatron.core.distributed import DistributedDataParallel as DDP
 from megatron.core.distributed.fsdp.mcore_fsdp_adapter import FullyShardedDataParallel as megatron_FSDP
 from megatron.core.optimizer.optimizer import param_group_identifier_keys
+from megatron.training.compute_graph import (
+    ComputeGraphSettings,
+    ComputeGraphTracer,
+    mark_compute_graph_captured,
+    should_capture_compute_graph,
+)
 
 from megatron.core.optimizer.qk_clip import clip_qk
 
@@ -1623,6 +1629,17 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
                                      (iteration + 1) % args.save_dgrads_interval == 0)
     save_wgrads_in_this_iteration = (args.save_wgrads_interval is not None and
                                      (iteration + 1) % args.save_wgrads_interval == 0)
+    graph_tracer = None
+    if should_capture_compute_graph(args, iteration):
+        file_prefix = f"iter_{iteration}_rank_{args.rank}"
+        settings = ComputeGraphSettings(
+            output_dir=args.compute_graph_output_dir,
+            file_prefix=file_prefix,
+            file_format=args.compute_graph_format,
+        )
+        graph_tracer = ComputeGraphTracer(settings)
+        for chunk_index, model_chunk in enumerate(model):
+            graph_tracer.register_model(model_chunk, prefix=f"chunk{chunk_index}.")
     while rerun_state_machine.should_run_forward_backward(data_iterator):
         # Set grad to zero.
         for model_chunk in model:
@@ -1677,6 +1694,11 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
         if save_dgrads_in_this_iteration:
             save_dgrads(iteration + 1)
             disable_dgrad_logging()
+        if graph_tracer is not None:
+            graph_tracer.write_graphs()
+            graph_tracer.close()
+            mark_compute_graph_captured()
+            graph_tracer = None
 
         # Reset force_all_reduce field.
         for model_chunk in model:
