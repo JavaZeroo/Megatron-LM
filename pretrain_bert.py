@@ -11,6 +11,10 @@ from megatron.training import get_args
 from megatron.training import get_tokenizer
 from megatron.training import print_rank_0
 from megatron.training import get_timers
+from megatron.training.compute_graph import (
+    maybe_record_compute_graph_outputs,
+    maybe_tag_compute_graph_inputs,
+)
 from megatron.core import tensor_parallel
 from megatron.core.enums import ModelType
 import megatron.legacy.model
@@ -132,6 +136,13 @@ def forward_step(data_iterator, model):
     tokens, types, sentence_order, loss_mask, lm_labels, padding_mask = get_batch(
         data_iterator)
     timers('batch-generator').stop()
+    maybe_tag_compute_graph_inputs(
+        args,
+        input_ids=tokens,
+        token_type_ids=types,
+        labels=lm_labels,
+        attention_mask=padding_mask,
+    )
 
     if not args.bert_binary_head:
         types = None
@@ -140,6 +151,7 @@ def forward_step(data_iterator, model):
     output_tensor = model(tokens, padding_mask,
                           tokentype_ids=types, lm_labels=lm_labels)
 
+    maybe_record_compute_graph_outputs(args, output_tensor)
     return output_tensor, partial(loss_func, loss_mask, sentence_order)
 
 

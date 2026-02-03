@@ -26,6 +26,10 @@ from megatron.core.models.T5.t5_spec import (
     get_t5_encoder_with_transformer_engine_block_spec,
 )
 from megatron.training import get_args, get_tokenizer, get_timers, pretrain, print_rank_0
+from megatron.training.compute_graph import (
+    maybe_record_compute_graph_outputs,
+    maybe_tag_compute_graph_inputs,
+)
 from megatron.training.arguments import core_transformer_config_from_args
 from megatron.core.tokenizers import MegatronTokenizer
 from pretrain_gpt import loss_func
@@ -195,12 +199,22 @@ def forward_step(data_iterator, model: T5Model):
         data_iterator, use_local
     )
     timers('batch generator').stop()
+    maybe_tag_compute_graph_inputs(
+        args,
+        encoder_input_ids=tokens_enc,
+        decoder_input_ids=tokens_dec,
+        encoder_attention_mask=enc_mask,
+        decoder_attention_mask=dec_mask,
+        encoder_decoder_attention_mask=enc_dec_mask,
+        labels=lm_labels,
+    )
 
     # Forward model lm_labels
     output_tensor = model(
         tokens_enc, tokens_dec, enc_mask, dec_mask, enc_dec_mask, lm_labels=lm_labels
     )
 
+    maybe_record_compute_graph_outputs(args, output_tensor)
     return output_tensor, partial(loss_func, loss_mask)
 
 

@@ -54,3 +54,26 @@ class ProfilingConfig:
     nvtx_ranges: bool = False
     """Enable NVTX range annotations for profiling. When enabled, inserts NVTX markers
     to categorize execution in profiler output."""
+
+
+@dataclass(kw_only=True)
+class ComputeGraphConfig:
+    """Configuration settings for exporting a module-level compute graph."""
+
+    compute_graph: bool = False
+    """Enable compute graph export during training."""
+
+    compute_graph_output_dir: str = "compute_graph"
+    """Directory to write compute graph artifacts."""
+
+    compute_graph_format: str = "svg"
+    """Output format for rendered graphs (e.g., svg, png, pdf, dot)."""
+
+    compute_graph_mode: str = "both"
+    """Graph detail level: module, autograd, or both."""
+
+    compute_graph_ranks: list[int] = field(default_factory=lambda: [0])
+    """Global ranks that will export the graph."""
+
+    compute_graph_iteration: int = 0
+    """Training iteration to capture the graph."""

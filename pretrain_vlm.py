@@ -38,6 +38,10 @@ from megatron.training import (
     pretrain,
     print_rank_0,
 )
+from megatron.training.compute_graph import (
+    maybe_record_compute_graph_outputs,
+    maybe_tag_compute_graph_inputs,
+)
 from megatron.training.arguments import core_transformer_config_from_args
 from pretrain_gpt import loss_func
 
@@ -372,17 +376,27 @@ def forward_step(data_iterator, model: LLaVAModel):
         output_tensor (torch.Tensor): Loss of shape [b, s] if labels are provided, otherwise logits of shape [b, s, vocab_size].
         loss_func (callable): Loss function with a loss mask specified.
     """
+    args = get_args()
     timers = get_timers()
 
     # Get the batch.
     timers('batch-generator', log_level=2).start()
     tokens, position_ids, labels, images, loss_mask, attention_mask, packed_seq_params = get_batch(data_iterator)
     timers('batch-generator').stop()
+    maybe_tag_compute_graph_inputs(
+        args,
+        input_ids=tokens,
+        position_ids=position_ids,
+        pixel_values=images,
+        attention_mask=attention_mask,
+        labels=labels,
+    )
 
     output_tensor, loss_mask = model(
         images, tokens, position_ids, attention_mask, labels, loss_mask, packed_seq_params=packed_seq_params
     )
 
+    maybe_record_compute_graph_outputs(args, output_tensor)
     return output_tensor, partial(loss_func, loss_mask)
 
 
