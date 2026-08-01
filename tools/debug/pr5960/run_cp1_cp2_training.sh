@@ -56,10 +56,12 @@ fi
 mkdir -p "${OUT_ROOT}"
 
 HEAD_SHA="$(git -C "${MEGATRON_REPO}" rev-parse HEAD)"
+SOURCE_DIFF_SHA256="$(git -C "${MEGATRON_REPO}" diff --binary | sha256sum | cut -d' ' -f1)"
 {
   echo "timestamp=$(date --iso-8601=seconds)"
   echo "repo=${MEGATRON_REPO}"
   echo "head=${HEAD_SHA}"
+  echo "source_diff_sha256=${SOURCE_DIFF_SHA256}"
   echo "expected_pr_head=${EXPECTED_PR_HEAD}"
   echo "data_prefix=${DATA_PREFIX}"
   echo "steps=${STEPS}"
@@ -364,10 +366,18 @@ print(f"FIRST_STEP_INDEXER_ABS_DIFF={first_indexer_abs_diff:.10e}")
 print(f"MAX_ABS_LM_DIFF={max_lm_abs_diff:.10e}")
 print(f"MAX_ABS_INDEXER_DIFF={max_indexer_abs_diff:.10e}")
 print(f"ATOL={atol:.1e}")
-print("CP_GT_1_BUG_REPRODUCED=" + ("YES" if first_indexer_abs_diff > atol else "NO"))
+indexer_aligned = max_indexer_abs_diff <= atol
+lm_aligned = max_lm_abs_diff <= atol
+print("INDEXER_ALIGNMENT=" + ("PASS" if indexer_aligned else "FAIL"))
+print("LM_ALIGNMENT=" + ("PASS" if lm_aligned else "FAIL"))
+print("CP_GT_1_BUG_REPRODUCED=" + ("NO" if indexer_aligned else "YES"))
 print(f"CSV={csv_path}")
+if not indexer_aligned:
+    raise SystemExit(
+        f"max CP1/CP2 indexer loss diff {max_indexer_abs_diff:.10e} exceeds {atol:.1e}"
+    )
 PY
 
 echo
 echo "Done. Results: ${OUT_ROOT}"
-echo "Primary gate: iteration-1 abs(CP2 indexer loss - CP1 indexer loss) > ${ATOL}"
+echo "Primary gate: max over all steps abs(CP2 indexer loss - CP1 indexer loss) <= ${ATOL}"

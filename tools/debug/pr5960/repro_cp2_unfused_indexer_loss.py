@@ -136,6 +136,7 @@ def main():
         )
 
     selected = selected.squeeze(0)
+    kv_full = torch.cat((original_kv, compressed_kv), dim=0)
 
     def current_cp_helper_loss(start, end):
         # Sparse loss does not consume indexer_layout, but retain the real ABI.
@@ -144,12 +145,20 @@ def main():
             torch.tensor([0, compressed_len], dtype=torch.int32, device=device),
             torch.tensor([start], dtype=torch.int32, device=device),
         )
+        selected_compressed_physical = torch.where(
+            selected[start:end] >= 0,
+            selected[start:end] + seq_len,
+            selected[start:end],
+        )
+        attention_indices = torch.cat(
+            (selected_compressed_physical, window_indices[start:end]), dim=-1
+        )
         with torch.no_grad():
             _, loss = _unfused_indexer_sparse_attn_from_topk(
                 teacher_q[start:end],
-                compressed_kv,  # Attention output is discarded in this loss-only seam.
+                kv_full,
                 attn_sink,
-                selected[start:end],
+                attention_indices,
                 q_indexer[start:end, 0],
                 k_indexer[:, 0],
                 weights[start:end, 0],

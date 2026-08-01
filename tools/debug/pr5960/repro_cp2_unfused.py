@@ -126,6 +126,7 @@ class _ForceUnfusedPlugin:
 
     def __init__(self) -> None:
         self.patched = False
+        self.diagnostics_patched = False
         self.passed_calls = 0
         self.failed_calls = 0
         self.skipped_setups = 0
@@ -140,6 +141,18 @@ class _ForceUnfusedPlugin:
                 # False makes its config set dsa_kernel_backend="none" on every GPU.
                 module._dsv4_cp_fused_kernels_available = lambda: False
                 self.patched = True
+                if not self.diagnostics_patched:
+                    original_assert = module._assert_cp_tensor_match
+
+                    def assert_with_immediate_diagnostics(actual, expected, label):
+                        try:
+                            return original_assert(actual, expected, label)
+                        except AssertionError as exc:
+                            print(f"[PR5960-CP2] ASSERTION: {exc}", flush=True)
+                            raise
+
+                    module._assert_cp_tensor_match = assert_with_immediate_diagnostics
+                    self.diagnostics_patched = True
 
         # These CP tests do not consume /opt/data.  Avoid an unrelated download
         # attempt in the repository-wide autouse fixture when running standalone.
