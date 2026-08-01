@@ -144,7 +144,7 @@ COMMON_ARGS=(
   --attention-backend unfused
   --transformer-impl transformer_engine
   --normalization RMSNorm
-  --layernorm-epsilon 1e-6
+  --norm-epsilon 1e-6
   --qk-layernorm
   --swiglu
   --disable-bias-linear
